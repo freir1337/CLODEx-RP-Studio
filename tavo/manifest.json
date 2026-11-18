@@ -2,12 +2,12 @@
   "specVersion": 2,
   "id": "xyz.clodex.rp-studio",
   "name": { "$t": "plugin.name" },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "minAppVersion": "0.93.0",
   "entry": "entry.js",
   "author": "CLODEx",
   "description": { "$t": "plugin.description" },
-  "releaseNotes": { "$t": "releaseNotes.1_0_0" },
+  "releaseNotes": { "$t": "releaseNotes.1_1_0" },
   "localization": {
     "defaultLocale": "en",
     "resources": {
@@ -43,6 +43,10 @@
         "label": { "$t": "actions.toggleStudio" }
       },
       {
+        "id": "open-forge",
+        "label": { "$t": "actions.openForge" }
+      },
+      {
         "id": "sync-tracker",
         "label": { "$t": "actions.syncTracker" }
       },
@@ -52,6 +56,12 @@
       }
     ],
     "lastMessageActions": [
+      {
+        "id": "speak-last-turn",
+        "label": { "$t": "actions.speakLast" },
+        "icon": "icons/voice.png",
+        "role": "character"
+      },
       {
         "id": "sync-last-turn",
         "label": { "$t": "actions.syncTracker" },

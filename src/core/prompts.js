@@ -89,6 +89,22 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
         lines.push(`• Recorded offspring / family tree: ${kids}.`);
     }
 
+    if (Array.isArray(state.customMeters) && state.customMeters.length > 0) {
+        const metersStr = state.customMeters
+            .map(m => `${m.label}: ${m.value}/${m.max}${m.min < 0 ? ` (min ${m.min})` : ''}`)
+            .join(' | ');
+        lines.push(`• Active Story Meters: ${metersStr}.`);
+    }
+
+    if (state.inventory) {
+        for (const role of activeEntitiesForTarget(state.world.targetMode)) {
+            const items = state.inventory[role];
+            if (Array.isArray(items) && items.length > 0) {
+                lines.push(`• ${names[role]} Inventory / Active Items: ${items.join(', ')}.`);
+            }
+        }
+    }
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -102,6 +118,10 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
         .map(m => `${m.role === 'user' ? userName : charName}: ${String(m.content ?? '').slice(0, 1800)}`)
         .join('\n\n');
 
+    const meterSchemaHint = Array.isArray(state.customMeters) && state.customMeters.length > 0
+        ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
+        : '';
+
     const systemPrompt = [
         'You are a strict JSON state-delta extractor for a roleplay simulation engine.',
         'Analyze ONLY what explicitly happened in the latest exchange (ignoring flashbacks or hypothetical speech) and return ONE valid JSON object with no markdown fences.',
@@ -113,6 +133,9 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
         '  "timeOfDay": "morning" | "day" | "evening" | "night",',
         '  "location": "short current location or empty string",',
         '  "weather": "short weather/atmosphere or empty string",',
+        meterSchemaHint ? `  "customMeters": { ${meterSchemaHint} },` : '  "customMeters": {},',
+        '  "inventoryAdd": { "user": [], "char": [] }, // short item names newly acquired/equipped this turn',
+        '  "inventoryRemove": { "user": [], "char": [] }, // items lost/consumed/dropped this turn',
         '  "entities": {',
         '    "user": {',
         '      "heartRate": 72, // integer 45..200 reflecting physical exertion, fear, arousal, shock, or rest',

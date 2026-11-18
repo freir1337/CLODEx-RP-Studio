@@ -147,7 +147,7 @@
 
 .clodex-rp-tabs {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 4px;
     padding: 8px 10px;
     border-bottom: 1px solid var(--clodex-rp-border);
@@ -201,13 +201,34 @@
     gap: 8px;
 }
 
-@media (max-width: 520px) {
+@media (max-width: 560px) {
     .clodex-rp-grid-2 {
         grid-template-columns: 1fr;
     }
     .clodex-rp-tabs {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: repeat(3, minmax(0, 1fr));
     }
+}
+
+.clodex-rp-forge-card {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+}
+
+.clodex-rp-forge-avatar {
+    width: 96px;
+    height: 128px;
+    object-fit: cover;
+    border-radius: 10px;
+    border: 1px solid rgba(245, 158, 11, 0.45);
+    flex-shrink: 0;
+}
+
+.clodex-rp-audio {
+    width: 100%;
+    height: 36px;
+    margin-top: 6px;
 }
 
 .clodex-rp-field {

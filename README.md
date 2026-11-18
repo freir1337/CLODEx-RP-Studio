@@ -22,11 +22,16 @@
    - Готовые пресеты: *Хранитель лора карточки и чата*, *Библия, латынь и Данте («Библейский Мистраль»)*, *Медицина и анатомия*, *Свой промпт*.
    - Кнопки в 1 клик на каждом ответе: **«В поле ввода»** и **«В память ИИ на следующий ход»**.
 
-3. **Живой фон и видео сцены (Nano Banana + Video Loop):**
+3. **Живой фон, видео сцены и Озвучка персонажа (Nano Banana + Video + TTS):**
    - Иллюстрация текущей сцены через `/v1/images/generations` (рекомендуются модели **Nano Banana** / Gemini Image) с установкой прямо на фон чата.
-   - Оживление сцены в зацикленный видео-фон через `/v1/videos` (Image-to-Video) с безопасным сохранением `taskId` и подтверждением платных вызовов.
+   - Оживление сцены в зацикленный видео-фон через `/v1/videos` (Image-to-Video) с безопасным сохранением `taskId`.
+   - **Озвучка реплик (`/v1/audio/speech`):** кнопка озвучки прямо под ответом персонажа в Tavo AI и в шторке Studio с умным фильтром *«озвучивать только прямую речь без звёздочек»*.
 
-4. **Кошелёк и модели CLODEx:**
+4. **Свои шкалы, Инвентарь и Кузница Персонажей (`v1.1`):**
+   - **Свои шкалы и инвентарь:** готовые паки (*Дарк-романс: Одержимость/Грех/Доверие*, *Фэнтези: Рассудок/Мана/Золото*, *Детектив*) и любые собственные ползунки с авто-ведением ИИ и откатом при свайпах.
+   - **Кузница Персонажей и Лорбуков в 1 клик:** по короткой задумке создаёт полную карточку **Character Card V2** со встроенным лорбуком, рисует портрет в **Nano Banana**, вшивает данные в PNG-карточку и импортирует прямо в библиотеку Tavo AI / SillyTavern.
+
+5. **Кошелёк и модели CLODEx:**
    - Живой баланс ключа `sk-...` в USD и ₽, справочные цены из `/api/pricing`, авто-подхват ключа из базового расширения `CLODEx for SillyTavern` (если оно уже установлено в SillyTavern).
 
 ---
@@ -34,9 +39,9 @@
 ## Установка в Tavo AI (`tavoai.dev` — iOS / Android / Web / Desktop)
 
 1. Скачайте готовый пакет **`.tpg`** из последнего релиза:
-   **[Скачать CLODEx-RP-Studio-1.0.0.tpg](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.0.0/CLODEx-RP-Studio-1.0.0.tpg)**
+   **[Скачать CLODEx-RP-Studio-1.1.0.tpg](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.1.0/CLODEx-RP-Studio-1.1.0.tpg)**
 2. В **Tavo AI** включите **Advanced Rendering** для чата.
-3. Откройте **More → Plugins → Import (`.tpg`)**, выберите скачанный файл `CLODEx-RP-Studio-1.0.0.tpg` и включите плагин.
+3. Откройте **More → Plugins → Import (`.tpg`)**, выберите скачанный файл `CLODEx-RP-Studio-1.1.0.tpg` и включите плагин.
 4. В настройках плагина (или прямо внутри чата во вкладке **«Ключ и Модели»**) вставьте ключ `sk-...` с `https://clodex.xyz` и нажмите **«Подключить и обновить каталог»**.
 
 ---
@@ -52,7 +57,7 @@
 3. Обновите страницу (F5). Сверху чата появится перетаскиваемая статус-полоска **CLODEx RP Studio**.
 
 ### Вариант Б — Вручную из архива
-Скачайте **[CLODEx-RP-Studio-SillyTavern-1.0.0.zip](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.0.0/CLODEx-RP-Studio-SillyTavern-1.0.0.zip)** и распакуйте папку `CLODEx-RP-Studio` в `<SillyTavern>/data/<профиль>/extensions/CLODEx-RP-Studio`, затем обновите страницу.
+Скачайте **[CLODEx-RP-Studio-SillyTavern-1.1.0.zip](https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio/releases/download/v1.1.0/CLODEx-RP-Studio-SillyTavern-1.1.0.zip)** и распакуйте папку `CLODEx-RP-Studio` в `<SillyTavern>/data/<профиль>/extensions/CLODEx-RP-Studio`, затем обновите страницу.
 
 ---
 

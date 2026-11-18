@@ -88,7 +88,8 @@ async function readMediaBlob(response, expectedType, maxBytes = MAX_MEDIA_BYTES)
         throw new ApiError('Invalid or oversized media payload.', { code: 'invalid_media' });
     }
     const finalType = contentType.startsWith(`${expectedType}/`) ? contentType
-        : expectedType === 'video' ? 'video/mp4' : 'image/png';
+        : expectedType === 'video' ? 'video/mp4'
+            : expectedType === 'audio' ? 'audio/mpeg' : 'image/png';
     return blob.type === finalType ? blob : new Blob([blob], { type: finalType });
 }
 function bytesToBase64(bytes) {
@@ -186,6 +187,25 @@ class ClodexApi {
 
     status(signal) {
         return this.request('/api/status', { signal, auth: false, timeout: 15_000 });
+    }
+
+    voices(model, { search = '', page = 1, signal } = {}) {
+        if (!model) throw new ApiError('Select a CLODEx speech model first.', { code: 'model_required' });
+        const query = new URLSearchParams({ model, search, page: String(page), page_size: '100' });
+        return this.request(`/v1/audio/voices?${query}`, { signal, timeout: 30_000 });
+    }
+
+    speech({ model, input, voice = 'alloy' }, signal) {
+        if (!model) throw new ApiError('Select a CLODEx speech model first.', { code: 'model_required' });
+        const text = String(input ?? '').trim();
+        if (!text) throw new ApiError('Speech text is empty.', { code: 'empty_input' });
+        return this.request('/v1/audio/speech', {
+            method: 'POST',
+            body: { model, input: text.slice(0, 8000), voice: String(voice || 'alloy'), response_format: 'mp3' },
+            blob: 'audio',
+            signal,
+            timeout: 120_000,
+        });
     }
 
     async chat({ model, messages, temperature = 0.25, maxTokens = 600, jsonMode = false }, signal) {
@@ -344,7 +364,8 @@ function pickRecommendedModels(catalog, current = {}) {
     const textModels = catalog.filter(m => m.kinds.includes('text'));
     const imageModels = catalog.filter(m => m.kinds.includes('image'));
     const videoModels = catalog.filter(m => m.kinds.includes('video'));
-    const has = (list, id) => Boolean(id && list.some(m => m.id === id || m.id === id));
+    const speechModels = catalog.filter(m => m.kinds.includes('speech'));
+    const has = (list, id) => Boolean(id && list.some(m => m.id === id));
 
     const trackerModel = has(catalog, current.trackerModel) ? current.trackerModel
         : (textModels.find(m => /flash-lite|ministral|mistral-small|gpt-4o-mini|gpt-4\.1-mini|haiku|flash/i.test(m.id))
@@ -362,7 +383,11 @@ function pickRecommendedModels(catalog, current = {}) {
     const videoModel = has(catalog, current.videoModel) ? current.videoModel
         : videoModels[0]?.id ?? '';
 
-    return { trackerModel, codexModel, imageModel, videoModel };
+    const speechModel = has(catalog, current.speechModel) ? current.speechModel
+        : (speechModels.find(m => /eleven|tts-1|gpt-4o-mini-tts/i.test(m.id))
+            ?? speechModels[0])?.id ?? '';
+
+    return { trackerModel, codexModel, imageModel, videoModel, speechModel };
 }
 function priceView(price) {
     if (!price) return null;
@@ -488,6 +513,54 @@ const SHELL_TRAITS = Object.freeze(['healthy', 'pearl_smooth', 'calcified', 'thi
 const COMPLICATION_POOL = Object.freeze([
     'none', 'morning_sickness', 'mild_anemia', 'fatigue_flare', 'blood_pressure_spike', 'back_strain',
 ]);
+const METER_PRESET_PACKS = Object.freeze({
+    dark_romance: {
+        ru: [
+            { id: 'obsession', label: 'Одержимость', icon: '🖤', min: 0, max: 100, value: 25, showInHud: true },
+            { id: 'sin', label: 'Уровень греха', icon: '🕯', min: 0, max: 100, value: 10, showInHud: false },
+            { id: 'trust', label: 'Доверие', icon: '🤝', min: -100, max: 100, value: 0, showInHud: false },
+        ],
+        en: [
+            { id: 'obsession', label: 'Obsession', icon: '🖤', min: 0, max: 100, value: 25, showInHud: true },
+            { id: 'sin', label: 'Sin / Corruption', icon: '🕯', min: 0, max: 100, value: 10, showInHud: false },
+            { id: 'trust', label: 'Trust', icon: '🤝', min: -100, max: 100, value: 0, showInHud: false },
+        ],
+    },
+    fantasy_rpg: {
+        ru: [
+            { id: 'sanity', label: 'Рассудок', icon: '🧠', min: 0, max: 100, value: 90, showInHud: true },
+            { id: 'mana', label: 'Мана / Вера', icon: '✨', min: 0, max: 100, value: 80, showInHud: false },
+            { id: 'gold', label: 'Золото', icon: '🪙', min: 0, max: 9999, value: 50, showInHud: false },
+        ],
+        en: [
+            { id: 'sanity', label: 'Sanity', icon: '🧠', min: 0, max: 100, value: 90, showInHud: true },
+            { id: 'mana', label: 'Mana / Faith', icon: '✨', min: 0, max: 100, value: 80, showInHud: false },
+            { id: 'gold', label: 'Gold', icon: '🪙', min: 0, max: 9999, value: 50, showInHud: false },
+        ],
+    },
+    detective: {
+        ru: [
+            { id: 'suspicion', label: 'Подозрение', icon: '👁', min: 0, max: 100, value: 15, showInHud: true },
+            { id: 'clues', label: 'Улики', icon: '📂', min: 0, max: 20, value: 0, showInHud: false },
+        ],
+        en: [
+            { id: 'suspicion', label: 'Suspicion', icon: '👁', min: 0, max: 100, value: 15, showInHud: true },
+            { id: 'clues', label: 'Clues Found', icon: '📂', min: 0, max: 20, value: 0, showInHud: false },
+        ],
+    },
+});
+function applyMeterPresetPack(state, packId, locale = 'ru') {
+    const pack = METER_PRESET_PACKS[packId];
+    if (!pack) return state;
+    const lang = String(locale).toLowerCase().startsWith('ru') ? 'ru' : 'en';
+    for (const tpl of pack[lang]) {
+        if (state.customMeters.length >= 8) break;
+        if (!state.customMeters.some(m => m.id === tpl.id)) {
+            state.customMeters.push({ ...tpl });
+        }
+    }
+    return state;
+}
 
 const clamp = (val, min, max) => Math.min(max, Math.max(min, Number.isFinite(val) ? val : min));
 function defaultRng() {
@@ -575,6 +648,11 @@ function createChatState(initialDate = '2026-09-01') {
             char: createEntityState('char'),
         },
         offspring: [],    // [{ id, name, parentRole, originMode, gender, bornDate, notes }]
+        customMeters: [], // [{ id, label, icon, min, max, value, showInHud }]
+        inventory: {
+            char: [],     // ['Silver Crucifix', ...]
+            user: [],
+        },
         scene: {
             imagePath: '',
             imagePrompt: '',
@@ -582,6 +660,7 @@ function createChatState(initialDate = '2026-09-01') {
             videoTaskId: '',
             videoStatus: 'idle',
             turnsSinceAutoImage: 0,
+            lastAudioPath: '',
         },
         codexHistory: [], // [{ role: 'user'|'assistant', content, preset, model, at }]
         activityLog: [],  // [{ atDate, summary }]
@@ -691,6 +770,32 @@ function normalizeChatState(raw) {
         out.scene.videoTaskId = String(raw.scene.videoTaskId ?? '').slice(0, 200);
         out.scene.videoStatus = String(raw.scene.videoStatus || 'idle').slice(0, 40);
         out.scene.turnsSinceAutoImage = Math.max(0, Math.trunc(Number(raw.scene.turnsSinceAutoImage) || 0));
+        out.scene.lastAudioPath = String(raw.scene.lastAudioPath ?? '').slice(0, 500);
+    }
+    if (Array.isArray(raw.customMeters)) {
+        out.customMeters = raw.customMeters.slice(0, 8).map((m, idx) => {
+            const min = Number.isFinite(Number(m.min)) ? Math.trunc(Number(m.min)) : 0;
+            const max = Number.isFinite(Number(m.max)) && Number(m.max) > min ? Math.trunc(Number(m.max)) : min + 100;
+            return {
+                id: String(m.id || `meter_${idx + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || `meter_${idx + 1}`,
+                label: String(m.label ?? '').trim().slice(0, 60) || `Meter ${idx + 1}`,
+                icon: String(m.icon ?? '📊').trim().slice(0, 8) || '📊',
+                min,
+                max,
+                value: Math.round(clamp(Number(m.value) || 0, min, max)),
+                showInHud: Boolean(m.showInHud),
+            };
+        });
+    }
+    if (raw.inventory && typeof raw.inventory === 'object') {
+        for (const role of ['char', 'user']) {
+            if (Array.isArray(raw.inventory[role])) {
+                out.inventory[role] = raw.inventory[role]
+                    .map(item => String(item ?? '').trim().slice(0, 80))
+                    .filter(Boolean)
+                    .slice(0, 20);
+            }
+        }
     }
     if (Array.isArray(raw.codexHistory)) {
         out.codexHistory = raw.codexHistory.slice(-24).map(item => ({
@@ -1102,6 +1207,35 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
         }
     }
 
+    // Update custom meters if present
+    if (delta.customMeters && typeof delta.customMeters === 'object') {
+        for (const meter of state.customMeters) {
+            const nextVal = Number(delta.customMeters[meter.id]);
+            if (Number.isFinite(nextVal)) {
+                meter.value = Math.round(clamp(nextVal, meter.min, meter.max));
+            }
+        }
+    }
+
+    // Update inventory additions & removals
+    for (const role of ['char', 'user']) {
+        const added = delta.inventoryAdd?.[role];
+        if (Array.isArray(added)) {
+            for (const rawItem of added) {
+                const item = String(rawItem ?? '').trim().slice(0, 80);
+                if (item && state.inventory[role].length < 20
+                    && !state.inventory[role].some(x => x.toLowerCase() === item.toLowerCase())) {
+                    state.inventory[role].push(item);
+                }
+            }
+        }
+        const removed = delta.inventoryRemove?.[role];
+        if (Array.isArray(removed) && removed.length) {
+            const lowerRem = new Set(removed.map(x => String(x ?? '').trim().toLowerCase()));
+            state.inventory[role] = state.inventory[role].filter(x => !lowerRem.has(x.toLowerCase()));
+        }
+    }
+
     if (checkpointKey) saveCheckpoint(state, checkpointKey);
     return state;
 }
@@ -1229,6 +1363,22 @@ function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}
         lines.push(`• Recorded offspring / family tree: ${kids}.`);
     }
 
+    if (Array.isArray(state.customMeters) && state.customMeters.length > 0) {
+        const metersStr = state.customMeters
+            .map(m => `${m.label}: ${m.value}/${m.max}${m.min < 0 ? ` (min ${m.min})` : ''}`)
+            .join(' | ');
+        lines.push(`• Active Story Meters: ${metersStr}.`);
+    }
+
+    if (state.inventory) {
+        for (const role of activeEntitiesForTarget(state.world.targetMode)) {
+            const items = state.inventory[role];
+            if (Array.isArray(items) && items.length > 0) {
+                lines.push(`• ${names[role]} Inventory / Active Items: ${items.join(', ')}.`);
+            }
+        }
+    }
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -1241,6 +1391,10 @@ function buildTrackerExtractionMessages(state, recentMessages, { userName = 'Use
         .map(m => `${m.role === 'user' ? userName : charName}: ${String(m.content ?? '').slice(0, 1800)}`)
         .join('\n\n');
 
+    const meterSchemaHint = Array.isArray(state.customMeters) && state.customMeters.length > 0
+        ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
+        : '';
+
     const systemPrompt = [
         'You are a strict JSON state-delta extractor for a roleplay simulation engine.',
         'Analyze ONLY what explicitly happened in the latest exchange (ignoring flashbacks or hypothetical speech) and return ONE valid JSON object with no markdown fences.',
@@ -1252,6 +1406,9 @@ function buildTrackerExtractionMessages(state, recentMessages, { userName = 'Use
         '  "timeOfDay": "morning" | "day" | "evening" | "night",',
         '  "location": "short current location or empty string",',
         '  "weather": "short weather/atmosphere or empty string",',
+        meterSchemaHint ? `  "customMeters": { ${meterSchemaHint} },` : '  "customMeters": {},',
+        '  "inventoryAdd": { "user": [], "char": [] }, // short item names newly acquired/equipped this turn',
+        '  "inventoryRemove": { "user": [], "char": [] }, // items lost/consumed/dropped this turn',
         '  "entities": {',
         '    "user": {',
         '      "heartRate": 72, // integer 45..200 reflecting physical exertion, fear, arousal, shock, or rest',
@@ -1411,6 +1568,371 @@ function buildCodexMessages({
     return messages;
 }
 
+// --- src/core/voice.js ---
+function isSafeVoiceId(value) {
+    return typeof value === 'string' && /^[a-zA-Z0-9_.:-]{1,200}$/.test(value);
+}
+function sanitizeVoiceLabel(value) {
+    return String(value ?? '')
+        .replace(/<[^>]*>/g, '')
+        .replace(/[<>&"'\x00-\x1f\x7f]/g, '')
+        .trim()
+        .slice(0, 180);
+}
+function normalizeVoices(payload) {
+    const list = Array.isArray(payload?.voices) ? payload.voices
+        : Array.isArray(payload?.data) ? payload.data : [];
+    const out = new Map();
+    for (const item of list) {
+        const id = String(item?.voice_id ?? item?.id ?? '').trim();
+        if (!isSafeVoiceId(id) || out.has(id)) continue;
+        const label = sanitizeVoiceLabel(item?.name || id);
+        const lang = String(item?.locale || item?.language || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24);
+        out.set(id, {
+            id,
+            name: label && label !== id ? `${label} (${id})` : id,
+            lang: lang || 'multi',
+        });
+    }
+    return [...out.values()];
+}
+function extractSpokenDialogue(rawMessage, { dialogueOnly = true, maxLength = 4000 } = {}) {
+    let cleaned = String(rawMessage ?? '')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/<[^>]+>/g, ' ')
+        .trim();
+
+    if (!cleaned) return '';
+
+    if (!dialogueOnly) {
+        // Full narration mode: simply remove markdown formatting markers
+        return cleaned
+            .replace(/[*_~`]+/g, '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, maxLength);
+    }
+
+    // 1) Strip explicit asterisk action blocks first (*sighs*, **...** kept if inside quotes? Wait: strip *action* outside quotes)
+    const quoted = [];
+    const quoteRegex = /«([^»]{2,})»|“([^”]{2,})”|„([^“”]{2,})[“”]|"([^"\n]{2,})"/g;
+    let match;
+    while ((match = quoteRegex.exec(cleaned)) !== null) {
+        const inner = (match[1] || match[2] || match[3] || match[4] || '')
+            .replace(/\*[^*]+\*/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (inner) quoted.push(inner);
+    }
+    if (quoted.length > 0) {
+        return quoted.join(' ').slice(0, maxLength);
+    }
+
+    // 2) Russian/literary dash-dialogue lines (e.g. "— Подойди сюда, — тихо сказал он.")
+    const dashLines = [];
+    for (const line of cleaned.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (/^[—–-]\s+\S/.test(trimmed)) {
+            // Remove narrator attribution after ", — " if followed by lowercase verb
+            const speechPart = trimmed
+                .replace(/^[—–-]\s*/, '')
+                .replace(/\*[^*]*\*/g, ' ')
+                .replace(/[,!?…]\s*[—–-]\s*[а-яёa-z][^.!?\n]*[.!?]?$/u, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (speechPart) dashLines.push(speechPart);
+        }
+    }
+    if (dashLines.length > 0) {
+        return dashLines.join(' ').slice(0, maxLength);
+    }
+
+    // 3) Fallback: strip *asterisk actions* and return remaining spoken text (if any)
+    const withoutActions = cleaned
+        .replace(/\*[^*]+\*/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    return withoutActions.slice(0, maxLength);
+}
+
+// --- src/core/pngCard.js ---
+// Pure Web-standard (Uint8Array / DataView) PNG Character Card V2 chunk injector & reader.
+// Works identically in Node.js 20+, SillyTavern browser, and Tavo AI mobile/desktop WebViews.
+
+const PNG_SIG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+
+function crc32Bytes(bytes) {
+    let crc = 0xffffffff;
+    for (let i = 0; i < bytes.length; i += 1) {
+        crc ^= bytes[i];
+        for (let bit = 0; bit < 8; bit += 1) {
+            crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+        }
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+function utf8ToBase64(text) {
+    const utf8 = new TextEncoder().encode(text);
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < utf8.length; i += chunk) {
+        binary += String.fromCharCode(...utf8.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+}
+
+function base64ToUtf8(b64) {
+    const binary = atob(b64.trim());
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+}
+
+function makeTextChunk(keyword, textValue) {
+    const keyBytes = new TextEncoder().encode(keyword);
+    const valBytes = new TextEncoder().encode(textValue);
+    const data = new Uint8Array(keyBytes.length + 1 + valBytes.length);
+    data.set(keyBytes, 0);
+    data[keyBytes.length] = 0; // null separator per PNG tEXt spec
+    data.set(valBytes, keyBytes.length + 1);
+
+    const typeBytes = new TextEncoder().encode('tEXt');
+    const crcInput = new Uint8Array(4 + data.length);
+    crcInput.set(typeBytes, 0);
+    crcInput.set(data, 4);
+    const crc = crc32Bytes(crcInput);
+
+    const out = new Uint8Array(12 + data.length);
+    const view = new DataView(out.buffer);
+    view.setUint32(0, data.length, false);
+    out.set(typeBytes, 4);
+    out.set(data, 8);
+    view.setUint32(8 + data.length, crc, false);
+    return out;
+}
+function assertValidPng(pngBytes) {
+    if (!(pngBytes instanceof Uint8Array) || pngBytes.length < 24) {
+        throw new Error('Invalid PNG buffer.');
+    }
+    for (let i = 0; i < 8; i += 1) {
+        if (pngBytes[i] !== PNG_SIG[i]) throw new Error('Invalid PNG signature.');
+    }
+}
+function embedCharacterCardInPng(pngBytes, cardObject) {
+    const input = pngBytes instanceof Uint8Array ? pngBytes : new Uint8Array(pngBytes);
+    assertValidPng(input);
+
+    const json = JSON.stringify(cardObject);
+    const charaChunk = makeTextChunk('chara', utf8ToBase64(json));
+
+    const keptChunks = [input.subarray(0, 8)];
+    const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+    let offset = 8;
+    let inserted = false;
+
+    while (offset + 12 <= input.length) {
+        const len = view.getUint32(offset, false);
+        const chunkEnd = offset + 12 + len;
+        if (chunkEnd > input.length) throw new Error('Truncated PNG chunk.');
+        const type = String.fromCharCode(
+            input[offset + 4], input[offset + 5], input[offset + 6], input[offset + 7],
+        );
+
+        if (type === 'tEXt') {
+            // Strip old chara/ccv3 chunk if replacing
+            const dataStart = offset + 8;
+            let zeroIdx = dataStart;
+            while (zeroIdx < dataStart + len && input[zeroIdx] !== 0) zeroIdx += 1;
+            const keyword = new TextDecoder().decode(input.subarray(dataStart, zeroIdx));
+            if (keyword === 'chara' || keyword === 'ccv3') {
+                offset = chunkEnd;
+                continue;
+            }
+        }
+
+        if (type === 'IEND' && !inserted) {
+            keptChunks.push(charaChunk);
+            inserted = true;
+        }
+        keptChunks.push(input.subarray(offset, chunkEnd));
+        offset = chunkEnd;
+        if (type === 'IEND') break;
+    }
+
+    if (!inserted) throw new Error('PNG missing IEND chunk.');
+    const totalLength = keptChunks.reduce((sum, part) => sum + part.length, 0);
+    const merged = new Uint8Array(totalLength);
+    let cursor = 0;
+    for (const part of keptChunks) {
+        merged.set(part, cursor);
+        cursor += part.length;
+    }
+    return merged;
+}
+function extractCharacterCardFromPng(pngBytes) {
+    const input = pngBytes instanceof Uint8Array ? pngBytes : new Uint8Array(pngBytes);
+    assertValidPng(input);
+    const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+    let offset = 8;
+
+    while (offset + 12 <= input.length) {
+        const len = view.getUint32(offset, false);
+        const chunkEnd = offset + 12 + len;
+        if (chunkEnd > input.length) break;
+        const type = String.fromCharCode(
+            input[offset + 4], input[offset + 5], input[offset + 6], input[offset + 7],
+        );
+        if (type === 'tEXt') {
+            const dataStart = offset + 8;
+            let zeroIdx = dataStart;
+            while (zeroIdx < dataStart + len && input[zeroIdx] !== 0) zeroIdx += 1;
+            const keyword = new TextDecoder().decode(input.subarray(dataStart, zeroIdx));
+            if (keyword === 'chara') {
+                const payloadB64 = new TextDecoder().decode(input.subarray(zeroIdx + 1, dataStart + len));
+                return JSON.parse(base64ToUtf8(payloadB64));
+            }
+        }
+        offset = chunkEnd;
+        if (type === 'IEND') break;
+    }
+    return null;
+}
+
+// --- src/core/forge.js ---
+const FORGE_CONCEPT_CHIPS = Object.freeze([
+    {
+        id: 'dante_inquisitor',
+        ru: 'Татуированный священник-экзорцист в сеттинге Божественной комедии Данте: холодный самоконтроль, тайная печать ереси, 5 статей лорбука по кругам и ордену.',
+        en: 'Tattooed exorcist priest in a Dantean dark-fantasy setting: icy restraint, hidden heretical seal, and 5 lorebook entries covering his order and infernal circles.',
+    },
+    {
+        id: 'omegaverse_duke',
+        ru: 'Северный герцог-альфа в сеттинге политического Омегаверса: вынужденный династический брак с {{user}}, запах морозного кедра и дыма, интриги двора.',
+        en: 'Northern Alpha Duke in a political Omegaverse court: arranged dynastic marriage with {{user}}, scent of frost cedar and smoke, courtly intrigue.',
+    },
+    {
+        id: 'cyber_medic',
+        ru: 'Подпольный кибер-хирург Нео-Киото: мрачный юмор, спасает раненого {{user}} в дождливом переулке, 5 записей лорбука о синдикатах и имплантах.',
+        en: 'Underground cyber-surgeon in rain-slicked Neo-Kyoto: dry wit, patching up an injured {{user}} in a neon back-alley clinic, with syndicate lorebook entries.',
+    },
+]);
+function buildForgePromptMessages({
+    concept,
+    language = 'ru',
+    loreCount = 5,
+} = {}) {
+    const cleanConcept = String(concept ?? '').trim();
+    if (!cleanConcept) throw new Error('Describe your character idea first.');
+
+    const targetLang = language === 'ru' ? 'Russian' : 'English';
+    const entriesTarget = Math.max(2, Math.min(8, Math.trunc(Number(loreCount) || 5)));
+
+    const systemPrompt = [
+        'You are a master Roleplay Character Card & Worldbook designer.',
+        `Write all roleplay text fields in ${targetLang}, EXCEPT "avatarPrompt" which MUST be a vivid English portrait generation prompt (60–110 words, no text overlays).`,
+        'Use {{char}} for the character and {{user}} for the player where appropriate. Make the opening scene ("first_mes") atmospheric, multi-paragraph, with vivid sensory detail and natural dialogue.',
+        `Include exactly ${entriesTarget} rich worldbook/lorebook entries in "lorebook" with 2–5 trigger keywords each.`,
+        'Return ONLY one valid JSON object (no markdown fences) matching this exact structure:',
+        '{',
+        '  "name": "Character Name",',
+        '  "description": "Detailed appearance, backstory, speech style, secrets, and traits...",',
+        '  "personality": "Concise personality summary...",',
+        '  "scenario": "Current situation and relationship to {{user}}...",',
+        '  "first_mes": "Rich opening scene and dialogue...",',
+        '  "alternate_greetings": ["Second alternative opening scene..."],',
+        '  "mes_example": "<START>\\n{{user}}: ...\\n{{char}}: ...",',
+        '  "system_prompt": "Stay in character as {{char}}, portray emotions and physical details vividly.",',
+        '  "tags": ["dark fantasy", "romance"],',
+        '  "avatarPrompt": "Detailed English visual portrait prompt of the character, lighting, attire, composition...",',
+        '  "lorebookName": "World Lorebook Title",',
+        '  "lorebook": [',
+        '    { "comment": "Entry Title", "keys": ["keyword1", "keyword2"], "content": "Detailed lore entry..." }',
+        '  ]',
+        '}',
+    ].join('\n');
+
+    return [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: `Create a complete character card and ${entriesTarget}-entry lorebook from this concept:\n\n${cleanConcept}` },
+    ];
+}
+function parseForgedCardV2(rawText) {
+    const text = String(rawText ?? '').trim();
+    if (!text) throw new Error('Empty Forge model response.');
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    const candidate = fenced ? fenced[1].trim() : text;
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start === -1 || end <= start) throw new Error('Forge response did not contain a JSON object.');
+
+    const raw = JSON.parse(candidate.slice(start, end + 1));
+    const name = String(raw.name ?? '').trim().slice(0, 80);
+    const firstMes = String(raw.first_mes ?? raw.firstMes ?? '').trim();
+    if (!name || !firstMes) {
+        throw new Error('Generated card is missing required name or first_mes.');
+    }
+
+    const rawEntries = Array.isArray(raw.lorebook) ? raw.lorebook : [];
+    const entries = rawEntries.slice(0, 12).map((entry, idx) => {
+        const keys = Array.isArray(entry?.keys)
+            ? entry.keys.map(k => String(k).trim()).filter(Boolean).slice(0, 8)
+            : String(entry?.keys ?? '').split(',').map(k => k.trim()).filter(Boolean).slice(0, 8);
+        return {
+            id: idx + 1,
+            keys: keys.length ? keys : [name],
+            secondary_keys: [],
+            comment: String(entry?.comment ?? `Lore #${idx + 1}`).slice(0, 120),
+            content: String(entry?.content ?? '').trim().slice(0, 3000),
+            constant: false,
+            selective: false,
+            insertion_order: 100 + idx,
+            enabled: true,
+            position: 'before_char',
+        };
+    }).filter(e => e.content);
+
+    const card = {
+        spec: 'chara_card_v2',
+        spec_version: '2.0',
+        data: {
+            name,
+            description: String(raw.description ?? '').trim(),
+            personality: String(raw.personality ?? '').trim(),
+            scenario: String(raw.scenario ?? '').trim(),
+            first_mes: firstMes,
+            mes_example: String(raw.mes_example ?? '').trim(),
+            creator_notes: 'Forged with CLODEx RP Studio (https://clodex.xyz)',
+            system_prompt: String(raw.system_prompt ?? '').trim(),
+            post_history_instructions: '',
+            alternate_greetings: Array.isArray(raw.alternate_greetings)
+                ? raw.alternate_greetings.map(s => String(s).trim()).filter(Boolean).slice(0, 4)
+                : [],
+            tags: Array.isArray(raw.tags)
+                ? raw.tags.map(t => String(t).trim()).filter(Boolean).slice(0, 12)
+                : ['clodex-rp-studio'],
+            creator: 'CLODEx RP Studio',
+            character_version: '1.1.0',
+            extensions: {},
+            character_book: {
+                name: String(raw.lorebookName || `${name} — Lorebook`).slice(0, 120),
+                description: '',
+                scan_depth: 4,
+                token_budget: 1024,
+                recursive_scanning: false,
+                extensions: {},
+                entries,
+            },
+        },
+    };
+
+    const avatarPrompt = String(raw.avatarPrompt ?? '').trim()
+        || `Portrait of ${name}, ${String(raw.description ?? '').slice(0, 220)}, cinematic lighting, detailed masterpiece`;
+
+    return { card, avatarPrompt };
+}
+
 // --- src/core/hud.js ---
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -1453,6 +1975,18 @@ function createRpStudioController(bridge) {
     let scenePromptDraft = '';
     let woundDraft = '';
     let woundBleedingDraft = true;
+    let meterNameDraft = '';
+    let meterIconDraft = '🖤';
+    let invItemDraft = '';
+
+    let voiceList = [];
+    let activeAudioUrl = '';
+
+    let forgeConcept = '';
+    let forgeLang = bridge.getLocale() === 'ru' ? 'ru' : 'en';
+    let forgeLoreCount = 5;
+    let forgeStatusText = '';
+    let forgedArtifact = null; // { card, pngBytes, base64Png, previewDataUrl, fileName }
 
     let catalog = [];
     let wallet = null;
@@ -1652,6 +2186,12 @@ function createRpStudioController(bridge) {
                 bioLabel = `${icon} D${b.cycleDay} · ${t(`bio.phase.${phase}`)}`;
             }
             chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, bioLabel));
+        }
+
+        if (Array.isArray(state.customMeters)) {
+            for (const m of state.customMeters.filter(item => item.showInHud).slice(0, 2)) {
+                chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, `${m.icon} ${m.label}: ${m.value}`));
+            }
         }
 
         if (state.world.pendingMemoryHint) {
@@ -1936,6 +2476,172 @@ function createRpStudioController(bridge) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
         } finally {
             if (activeAbort === abort) activeAbort = null;
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function loadSpeechVoices() {
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return [];
+        }
+        if (!catalog.length) await refreshAccount();
+        const model = bridge.getSettings().speechModel;
+        if (!model) {
+            errorBanner = 'Select a Voice (TTS) model in Key & Models.';
+            renderAll();
+            return [];
+        }
+        busyState = 'voices';
+        errorBanner = '';
+        renderAll();
+        try {
+            const payload = await api.voices(model);
+            voiceList = normalizeVoices(payload);
+            return voiceList;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, key);
+            return [];
+        } finally {
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function speakLatestReply({ explicitText = '', auto = false } = {}) {
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            if (!auto) {
+                activeTab = 'account';
+                toggleDrawer(true);
+            }
+            return '';
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.speechModel;
+        if (!model) {
+            if (!auto) errorBanner = 'Select a Voice (TTS) model in Key & Models.';
+            renderAll();
+            return '';
+        }
+
+        const rp = await bridge.getRpContext();
+        const rawSource = explicitText || rp.recentMessages?.filter(m => m.role === 'assistant').at(-1)?.content || '';
+        const spoken = extractSpokenDialogue(rawSource, { dialogueOnly: settings.dialogueOnly !== false });
+        if (!spoken) {
+            if (!auto) errorBanner = t('voice.noDialogue');
+            renderAll();
+            return '';
+        }
+
+        const charVoice = settings.voiceMap?.[rp.charName] || settings.defaultVoice || 'alloy';
+        const safeVoice = isSafeVoiceId(charVoice) ? charVoice : 'alloy';
+
+        if (!auto && settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'TTS', model }));
+            if (!ok) return '';
+        }
+
+        busyState = 'tts';
+        errorBanner = '';
+        renderAll();
+        try {
+            const audioBlob = await api.speech({ model, input: spoken, voice: safeVoice });
+            const base64 = await blobToBase64(audioBlob);
+            let savedPath = '';
+            if (bridge.saveSpeechAudio) {
+                savedPath = await bridge.saveSpeechAudio({ blob: audioBlob, base64 });
+            } else if (typeof URL?.createObjectURL === 'function') {
+                if (activeAudioUrl) URL.revokeObjectURL(activeAudioUrl);
+                activeAudioUrl = URL.createObjectURL(audioBlob);
+                savedPath = activeAudioUrl;
+            }
+            const state = bridge.getChatState();
+            state.scene.lastAudioPath = savedPath;
+            await bridge.saveChatState(state);
+            bridge.playAudioPreview?.(savedPath, audioBlob);
+            await refreshAccount().catch(() => {});
+            return savedPath;
+        } catch (err) {
+            if (!auto) errorBanner = redact(err?.message ?? err, key);
+            return '';
+        } finally {
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function runCharacterForge() {
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return null;
+        }
+        if (!forgeConcept.trim()) return null;
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const textModel = settings.codexModel || settings.trackerModel;
+        const imageModel = settings.imageModel;
+        if (!textModel || !imageModel) {
+            errorBanner = 'Select Text and Image (Nano Banana) models in Key & Models.';
+            renderAll();
+            return null;
+        }
+        if (settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', {
+                kind: 'Character + Avatar',
+                model: `${textModel} + ${imageModel}`,
+            }));
+            if (!ok) return null;
+        }
+
+        busyState = 'forge';
+        forgeStatusText = t('forge.generatingCard');
+        errorBanner = '';
+        renderAll();
+        try {
+            const msgs = buildForgePromptMessages({
+                concept: forgeConcept,
+                language: forgeLang,
+                loreCount: forgeLoreCount,
+            });
+            const cardJsonRaw = await api.chat({ model: textModel, messages: msgs, temperature: 0.7, maxTokens: 2800, jsonMode: true });
+            const { card, avatarPrompt } = parseForgedCardV2(cardJsonRaw);
+
+            forgeStatusText = t('forge.generatingAvatar');
+            renderAll();
+            const imgRes = await api.image({ model: imageModel, prompt: avatarPrompt });
+            const imgBlob = imgRes.b64_json
+                ? base64ToBlob(imgRes.b64_json, 'image/png')
+                : await api.downloadImage(imgRes.url);
+            const rawPngBytes = new Uint8Array(await imgBlob.arrayBuffer());
+            const embeddedPngBytes = embedCharacterCardInPng(rawPngBytes, card);
+            const base64Png = bytesToBase64(embeddedPngBytes);
+            const slug = card.data.name.toLowerCase().replace(/[^a-z0-9а-яё_-]+/giu, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'character';
+
+            forgedArtifact = {
+                card,
+                pngBytes: embeddedPngBytes,
+                base64Png,
+                previewDataUrl: `data:image/png;base64,${base64Png}`,
+                fileName: `${slug}-clodex-card.png`,
+            };
+            forgeStatusText = t('forge.doneStatus', {
+                name: card.data.name,
+                count: card.data.character_book?.entries?.length ?? 0,
+            });
+            await refreshAccount().catch(() => {});
+            return forgedArtifact;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, key);
+            forgeStatusText = '';
+            return null;
+        } finally {
             busyState = '';
             renderAll();
         }
@@ -2632,6 +3338,145 @@ function createRpStudioController(bridge) {
             container.append(bioCard);
         }
 
+        // Custom Story Meters & Inventory Card
+        const metersCard = el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `📊 ${t('meters.title')}`),
+            el(doc, 'div', { className: 'clodex-rp-chips' },
+                ...[
+                    ['dark_romance', t('meters.packDark')],
+                    ['fantasy_rpg', t('meters.packRpg')],
+                    ['detective', t('meters.packDetective')],
+                ].map(([packId, label]) => el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-chip-btn',
+                    onClick: async () => {
+                        applyMeterPresetPack(state, packId, bridge.getLocale());
+                        await bridge.saveChatState(state);
+                        renderAll();
+                    },
+                }, label)),
+            ),
+            state.customMeters.length === 0
+                ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('meters.empty'))
+                : el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' },
+                    ...state.customMeters.map(meter => el(doc, 'div', { className: 'clodex-rp-subbox' },
+                        el(doc, 'div', { className: 'clodex-rp-list-item' },
+                            el(doc, 'strong', {}, `${meter.icon} ${meter.label}: ${meter.value} / ${meter.max}`),
+                            el(doc, 'div', { className: 'clodex-rp-head-actions' },
+                                el(doc, 'label', { className: 'clodex-rp-check' },
+                                    el(doc, 'input', {
+                                        type: 'checkbox',
+                                        checked: meter.showInHud,
+                                        onChange: async e => {
+                                            meter.showInHud = e.target.checked;
+                                            await bridge.saveChatState(state);
+                                            renderHudPill();
+                                        },
+                                    }),
+                                    el(doc, 'span', {}, t('meters.pinHud')),
+                                ),
+                                el(doc, 'button', {
+                                    type: 'button',
+                                    className: 'clodex-rp-btn-mini',
+                                    onClick: async () => {
+                                        state.customMeters = state.customMeters.filter(m => m.id !== meter.id);
+                                        await bridge.saveChatState(state);
+                                        renderAll();
+                                    },
+                                }, '✕'),
+                            ),
+                        ),
+                        el(doc, 'input', {
+                            type: 'range',
+                            min: meter.min,
+                            max: meter.max,
+                            value: meter.value,
+                            onChange: async e => {
+                                meter.value = Number(e.target.value) || 0;
+                                await bridge.saveChatState(state);
+                                renderAll();
+                            },
+                        }),
+                    ))),
+            state.customMeters.length < 8 ? el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                el(doc, 'input', {
+                    type: 'text',
+                    className: 'clodex-rp-input',
+                    style: 'max-width:64px',
+                    placeholder: t('meters.iconPlaceholder'),
+                    value: meterIconDraft,
+                    onInput: e => { meterIconDraft = e.target.value; },
+                }),
+                el(doc, 'input', {
+                    type: 'text',
+                    className: 'clodex-rp-input',
+                    style: 'flex:1',
+                    placeholder: t('meters.namePlaceholder'),
+                    value: meterNameDraft,
+                    onInput: e => { meterNameDraft = e.target.value; },
+                }),
+                el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn',
+                    onClick: async () => {
+                        const cleanLabel = meterNameDraft.trim().slice(0, 50);
+                        if (!cleanLabel) return;
+                        const id = cleanLabel.toLowerCase().replace(/[^a-z0-9]+/g, '_') || `m_${Date.now()}`;
+                        state.customMeters.push({
+                            id: `${id}_${state.customMeters.length + 1}`,
+                            label: cleanLabel,
+                            icon: meterIconDraft.trim().slice(0, 6) || '📊',
+                            min: 0,
+                            max: 100,
+                            value: 50,
+                            showInHud: state.customMeters.length === 0,
+                        });
+                        meterNameDraft = '';
+                        await bridge.saveChatState(state);
+                        renderAll();
+                    },
+                }, t('meters.addBtn')),
+            ) : null,
+            el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+                el(doc, 'strong', {}, `🎒 ${t('inv.title')} (${t(`entity.${activeEntityRole}`)})`),
+                (state.inventory?.[activeEntityRole]?.length ?? 0) === 0
+                    ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('inv.empty'))
+                    : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                        ...state.inventory[activeEntityRole].map(item => el(doc, 'button', {
+                            type: 'button',
+                            className: 'clodex-rp-chip-btn',
+                            onClick: async () => {
+                                state.inventory[activeEntityRole] = state.inventory[activeEntityRole].filter(x => x !== item);
+                                await bridge.saveChatState(state);
+                                renderDrawer();
+                            },
+                        }, `${item} ✕`))),
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    el(doc, 'input', {
+                        type: 'text',
+                        className: 'clodex-rp-input',
+                        style: 'flex:1',
+                        placeholder: t('inv.itemPlaceholder'),
+                        value: invItemDraft,
+                        onInput: e => { invItemDraft = e.target.value; },
+                    }),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        onClick: async () => {
+                            const val = invItemDraft.trim().slice(0, 80);
+                            if (!val) return;
+                            state.inventory[activeEntityRole].push(val);
+                            invItemDraft = '';
+                            await bridge.saveChatState(state);
+                            renderDrawer();
+                        },
+                    }, t('inv.addBtn')),
+                ),
+            ),
+        );
+        container.append(metersCard);
+
         return container;
     }
 
@@ -2895,6 +3740,179 @@ function createRpStudioController(bridge) {
                 ),
             ),
         ));
+
+        // Character Voice (CLODEx TTS) Card
+        const audioSrc = bridge.resolveMediaSrc?.(state.scene.lastAudioPath) || state.scene.lastAudioPath || '';
+        const currentVoice = settings.defaultVoice || 'alloy';
+        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `🔊 ${t('voice.title')}`),
+            el(doc, 'div', { className: 'clodex-rp-grid-2' },
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('voice.voiceSelect')),
+                    voiceList.length > 0
+                        ? buildSelect(
+                            voiceList.map(v => ({ value: v.id, label: v.name })),
+                            currentVoice,
+                            async val => {
+                                await bridge.updateSettings({ defaultVoice: val });
+                                renderDrawer();
+                            },
+                        )
+                        : el(doc, 'input', {
+                            type: 'text',
+                            className: 'clodex-rp-input',
+                            placeholder: t('voice.voicePlaceholder'),
+                            value: currentVoice,
+                            onChange: async e => {
+                                await bridge.updateSettings({ defaultVoice: e.target.value.trim() || 'alloy' });
+                            },
+                        }),
+                ),
+                el(doc, 'div', { className: 'clodex-rp-btn-row', style: 'align-self:flex-end' },
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        disabled: busyState === 'voices',
+                        onClick: () => loadSpeechVoices(),
+                    }, `🎙 ${t('voice.loadVoices')}`),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-primary',
+                        disabled: busyState === 'tts',
+                        onClick: () => speakLatestReply({ auto: false }),
+                    }, busyState === 'tts' ? `⏳ ${t('voice.speaking')}` : `🔊 ${t('voice.speakLastBtn')}`),
+                ),
+            ),
+            el(doc, 'label', { className: 'clodex-rp-check clodex-rp-mt' },
+                el(doc, 'input', {
+                    type: 'checkbox',
+                    checked: settings.dialogueOnly !== false,
+                    onChange: async e => {
+                        await bridge.updateSettings({ dialogueOnly: e.target.checked });
+                    },
+                }),
+                el(doc, 'span', {}, t('voice.dialogueOnly')),
+            ),
+            audioSrc ? el(doc, 'audio', {
+                className: 'clodex-rp-audio',
+                controls: true,
+                autoplay: true,
+                src: audioSrc,
+            }) : null,
+        ));
+
+        return container;
+    }
+
+    function renderForgeTab() {
+        const locale = bridge.getLocale();
+        const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+
+        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `⚒️ ${t('forge.title')}`),
+            el(doc, 'p', { className: 'clodex-rp-muted' }, t('forge.subtitle')),
+            el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                ...[
+                    [FORGE_CONCEPT_CHIPS[0], t('forge.chipDante')],
+                    [FORGE_CONCEPT_CHIPS[1], t('forge.chipDuke')],
+                    [FORGE_CONCEPT_CHIPS[2], t('forge.chipMedic')],
+                ].map(([chip, label]) => el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-chip-btn',
+                    onClick: () => {
+                        forgeConcept = locale === 'ru' ? chip.ru : chip.en;
+                        forgeLang = locale;
+                        renderDrawer();
+                    },
+                }, label)),
+            ),
+            el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                el(doc, 'span', {}, t('forge.conceptLabel')),
+                el(doc, 'textarea', {
+                    className: 'clodex-rp-input',
+                    rows: 4,
+                    placeholder: t('forge.conceptPlaceholder'),
+                    value: forgeConcept,
+                    onInput: e => { forgeConcept = e.target.value; },
+                }),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('forge.langLabel')),
+                    buildSelect(
+                        [{ value: 'ru', label: 'Русский (RU)' }, { value: 'en', label: 'English (EN)' }],
+                        forgeLang,
+                        val => { forgeLang = val; },
+                    ),
+                ),
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, `${t('forge.loreCountLabel')}: ${forgeLoreCount}`),
+                    el(doc, 'input', {
+                        type: 'range',
+                        min: 2,
+                        max: 8,
+                        value: forgeLoreCount,
+                        onChange: e => {
+                            forgeLoreCount = Number(e.target.value) || 5;
+                            renderDrawer();
+                        },
+                    }),
+                ),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn clodex-rp-btn-primary',
+                    disabled: busyState === 'forge',
+                    onClick: () => runCharacterForge(),
+                }, busyState === 'forge' ? `⏳ ${forgeStatusText}` : `🔥 ${t('forge.generateBtn')}`),
+            ),
+            forgeStatusText && busyState !== 'forge'
+                ? el(doc, 'div', { className: 'clodex-rp-badge-line clodex-rp-mt' }, `✨ ${forgeStatusText}`)
+                : null,
+        ));
+
+        if (forgedArtifact) {
+            const d = forgedArtifact.card.data;
+            container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+                el(doc, 'div', { className: 'clodex-rp-forge-card' },
+                    el(doc, 'img', {
+                        className: 'clodex-rp-forge-avatar',
+                        src: forgedArtifact.previewDataUrl,
+                        alt: d.name,
+                    }),
+                    el(doc, 'div', { style: 'flex:1;min-width:0' },
+                        el(doc, 'strong', {}, d.name),
+                        el(doc, 'p', { className: 'clodex-rp-muted' }, `${d.personality.slice(0, 140)}…`),
+                        el(doc, 'div', { className: 'clodex-rp-muted' },
+                            `📚 ${d.character_book?.name || 'Lorebook'} (${d.character_book?.entries?.length ?? 0})`),
+                    ),
+                ),
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    bridge.importForgedCharacter ? el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-primary',
+                        onClick: async () => {
+                            try {
+                                await bridge.importForgedCharacter(forgedArtifact);
+                                bridge.notify?.(t('forge.importedNotice'));
+                            } catch (err) {
+                                errorBanner = redact(err?.message ?? err);
+                                renderDrawer();
+                            }
+                        },
+                    }, `📥 ${t('forge.importBtn')}`) : null,
+                    bridge.exportForgedCharacter ? el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        onClick: async () => {
+                            await bridge.exportForgedCharacter(forgedArtifact);
+                        },
+                    }, `💾 ${t('forge.downloadPngBtn')}`) : null,
+                ),
+            ));
+        }
+
         return container;
     }
 
@@ -2907,6 +3925,7 @@ function createRpStudioController(bridge) {
         const textModels = catalog.filter(m => m.kinds.includes('text') || !m.kinds.length);
         const imageModels = catalog.filter(m => m.kinds.includes('image'));
         const videoModels = catalog.filter(m => m.kinds.includes('video'));
+        const speechModels = catalog.filter(m => m.kinds.includes('speech'));
 
         const modelOptions = (list, current) => {
             const opts = list.map(m => ({
@@ -2980,6 +3999,12 @@ function createRpStudioController(bridge) {
                         await bridge.updateSettings({ videoModel: v });
                     }),
                 ),
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('account.speechModel')),
+                    buildSelect(modelOptions(speechModels.length ? speechModels : catalog, settings.speechModel), settings.speechModel, async v => {
+                        await bridge.updateSettings({ speechModel: v });
+                    }),
+                ),
             ),
             el(doc, 'div', { className: 'clodex-rp-toggles clodex-rp-mt' },
                 el(doc, 'label', { className: 'clodex-rp-check' },
@@ -2989,6 +4014,14 @@ function createRpStudioController(bridge) {
                         onChange: async e => { await bridge.updateSettings({ autoTrack: e.target.checked }); },
                     }),
                     el(doc, 'span', {}, t('account.autoTrack')),
+                ),
+                el(doc, 'label', { className: 'clodex-rp-check' },
+                    el(doc, 'input', {
+                        type: 'checkbox',
+                        checked: Boolean(settings.autoSpeak),
+                        onChange: async e => { await bridge.updateSettings({ autoSpeak: e.target.checked }); },
+                    }),
+                    el(doc, 'span', {}, t('account.autoSpeak')),
                 ),
                 el(doc, 'label', { className: 'clodex-rp-check' },
                     el(doc, 'input', {
@@ -3021,13 +4054,15 @@ function createRpStudioController(bridge) {
             ['tracker', `🧬 ${t('tab.tracker')}`],
             ['codex', `📜 ${t('tab.codex')}`],
             ['scene', `🍌 ${t('tab.scene')}`],
+            ['forge', `⚒️ ${t('tab.forge')}`],
             ['account', `🔑 ${t('tab.account')}`],
         ];
 
         const body = activeTab === 'codex' ? renderCodexTab(state)
             : activeTab === 'scene' ? renderSceneTab(state)
-                : activeTab === 'account' ? renderAccountTab()
-                    : renderTrackerTab(state);
+                : activeTab === 'forge' ? renderForgeTab()
+                    : activeTab === 'account' ? renderAccountTab()
+                        : renderTrackerTab(state);
 
         drawerPanel.replaceChildren(
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
@@ -3071,12 +4106,16 @@ function createRpStudioController(bridge) {
     async function onAssistantMessageCommitted({ checkpointKey = '' } = {}) {
         const settings = bridge.getSettings();
         const state = bridge.getChatState();
+
         if (state.world.pendingMemoryHint) {
             state.world.pendingMemoryHint = '';
             await bridge.saveChatState(state);
         }
         if (settings.autoTrack !== false && bridge.getEffectiveKey()) {
             await syncTrackerFromChat({ checkpointKey, silent: true });
+        }
+        if (settings.autoSpeak === true && bridge.getEffectiveKey()) {
+            await speakLatestReply({ auto: true });
         }
         const autoEvery = Number(settings.autoImageEvery || 0);
         if (autoEvery > 0 && bridge.getEffectiveKey()) {
@@ -3114,10 +4153,13 @@ function createRpStudioController(bridge) {
         toggleDrawer,
         syncTrackerFromChat,
         generateSceneBackground,
+        speakLatestReply,
+        runCharacterForge,
         onAssistantMessageCommitted,
         refreshAccount,
         dispose() {
             activeAbort?.abort();
+            if (activeAudioUrl) URL.revokeObjectURL(activeAudioUrl);
             unsubLocale?.();
             unsubInsets?.();
             win.removeEventListener?.('resize', onResize);
@@ -3145,6 +4187,11 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
         codexModel: '',
         imageModel: '',
         videoModel: '',
+        speechModel: '',
+        defaultVoice: 'alloy',
+        dialogueOnly: true,
+        autoSpeak: false,
+        voiceMap: {},
         autoTrack: tavo.plugin.config.get('autoTrack') !== false,
         injectContext: tavo.plugin.config.get('injectContext') !== false,
         confirmPaid: tavo.plugin.config.get('confirmPaid') !== false,
@@ -3265,6 +4312,34 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
             const b64 = await tavo.file.load(target, { encoding: 'base64' }).catch(() => null);
             return b64 ? `data:image/png;base64,${b64}` : '';
         },
+        async saveSpeechAudio({ base64 }) {
+            const prev = cachedState.scene?.lastAudioPath;
+            const nextName = prev?.endsWith('tts-a.mp3') ? 'clodex-rp-tts-b.mp3' : 'clodex-rp-tts-a.mp3';
+            const oldName = nextName === 'clodex-rp-tts-a.mp3' ? 'clodex-rp-tts-b.mp3' : 'clodex-rp-tts-a.mp3';
+            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64' });
+            await tavo.file.delete(oldName).catch(() => {});
+            return savedPath;
+        },
+        playAudioPreview(path) {
+            if (!path || typeof Audio !== 'function') return;
+            const audio = new Audio(path);
+            audio.play().catch(() => {});
+        },
+        async importForgedCharacter({ base64Png, fileName, card }) {
+            const safeName = String(fileName || 'clodex-forged-card.png').replace(/[^a-zA-Z0-9._-]/g, '_');
+            if (tavo.file?.save && tavo.character?.import) {
+                const savedPath = await tavo.file.save(safeName, base64Png, { encoding: 'base64' });
+                return await tavo.character.import(savedPath);
+            }
+            if (tavo.character?.import) {
+                return await tavo.character.import(card);
+            }
+            throw new Error('tavo.character.import is unavailable in this Tavo version.');
+        },
+        async exportForgedCharacter({ base64Png, fileName }) {
+            const safeName = String(fileName || 'clodex-forged-card.png').replace(/[^a-zA-Z0-9._-]/g, '_');
+            await tavo.file.export(safeName, base64Png, { encoding: 'base64' });
+        },
         loadHudPosition: () => cachedPrefs.hudPos,
         saveHudPosition(pos) {
             cachedPrefs.hudPos = pos;
@@ -3290,10 +4365,13 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
         const action = payload?.action;
         if (action === 'open-tracker') controller.openTab('tracker');
         else if (action === 'open-codex') controller.openTab('codex');
+        else if (action === 'open-forge') controller.openTab('forge');
         else if (action === 'sync-tracker') {
             await controller.syncTrackerFromChat({ checkpointKey: payload?.messageId || '' });
         } else if (action === 'generate-bg') {
             await controller.generateSceneBackground({ auto: false });
+        } else if (action === 'speak-reply') {
+            await controller.speakLatestReply({ explicitText: payload?.text || '', auto: false });
         }
     });
 

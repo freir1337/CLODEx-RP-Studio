@@ -12,6 +12,11 @@ export const DEFAULT_ST_SETTINGS = Object.freeze({
     codexModel: '',
     imageModel: '',
     videoModel: '',
+    speechModel: '',
+    defaultVoice: 'alloy',
+    dialogueOnly: true,
+    autoSpeak: false,
+    voiceMap: {},
     autoTrack: true,
     injectContext: true,
     confirmPaid: true,
@@ -28,6 +33,11 @@ export function loadStSettings(context) {
         codexModel: typeof raw.codexModel === 'string' ? raw.codexModel : '',
         imageModel: typeof raw.imageModel === 'string' ? raw.imageModel : '',
         videoModel: typeof raw.videoModel === 'string' ? raw.videoModel : '',
+        speechModel: typeof raw.speechModel === 'string' ? raw.speechModel : '',
+        defaultVoice: typeof raw.defaultVoice === 'string' && raw.defaultVoice ? raw.defaultVoice : 'alloy',
+        dialogueOnly: raw.dialogueOnly !== false,
+        autoSpeak: Boolean(raw.autoSpeak),
+        voiceMap: raw.voiceMap && typeof raw.voiceMap === 'object' ? { ...raw.voiceMap } : {},
         autoTrack: raw.autoTrack !== false,
         injectContext: raw.injectContext !== false,
         confirmPaid: raw.confirmPaid !== false,
@@ -245,6 +255,49 @@ export async function initializeSillyTavern({
             const blob = await res.blob();
             return `data:${blob.type || 'image/png'};base64,${await blobToBase64(blob)}`;
         },
+        async saveSpeechAudio({ blob }) {
+            return await uploadMediaToSt(getContext(), fetchImpl, blob, 'mp3');
+        },
+        playAudioPreview(path) {
+            if (!path || typeof Audio !== 'function') return;
+            const audio = new Audio(path);
+            audio.play().catch(() => {});
+        },
+        async importForgedCharacter({ pngBytes, fileName }) {
+            const ctx = getContext();
+            const blob = new Blob([pngBytes], { type: 'image/png' });
+            if (typeof FormData === 'function') {
+                const form = new FormData();
+                form.append('avatar', blob, fileName || 'clodex-card.png');
+                form.append('file_type', 'png');
+                const headers = new Headers(ctx.getRequestHeaders?.() ?? {});
+                headers.delete('Content-Type');
+                const res = await fetchImpl('/api/characters/import', {
+                    method: 'POST',
+                    headers,
+                    credentials: 'same-origin',
+                    body: form,
+                }).catch(() => null);
+                if (res?.ok) {
+                    await ctx.getCharacters?.();
+                    return true;
+                }
+            }
+            // Fallback: trigger PNG download so user can drag & drop into ST
+            await this.exportForgedCharacter({ pngBytes, fileName });
+            return true;
+        },
+        async exportForgedCharacter({ pngBytes, fileName }) {
+            const blob = new Blob([pngBytes], { type: 'image/png' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = fileName || 'clodex-card.png';
+            document.body.append(a);
+            a.click?.();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 5_000);
+        },
         loadHudPosition: () => settings.hudPos,
         saveHudPosition(pos) {
             settings.hudPos = pos;
@@ -304,7 +357,9 @@ export async function initializeSillyTavern({
     if (typeof context.registerSlashCommand === 'function') {
         context.registerSlashCommand('clodex-rp', () => controller.openTab('tracker'), [], 'Open CLODEx RP Studio Tracker', true, true);
         context.registerSlashCommand('clodex-codex', () => controller.openTab('codex'), [], 'Open CLODEx Lore Codex', true, true);
-        context.registerSlashCommand('clodex-scene', () => controller.openTab('scene'), [], 'Open CLODEx Scene & Video', true, true);
+        context.registerSlashCommand('clodex-scene', () => controller.openTab('scene'), [], 'Open CLODEx Scene & Voice', true, true);
+        context.registerSlashCommand('clodex-forge', () => controller.openTab('forge'), [], 'Open CLODEx Character & Lorebook Forge', true, true);
+        context.registerSlashCommand('clodex-speak', () => controller.speakLatestReply({ auto: false }), [], 'Speak latest character reply via CLODEx TTS', true, true);
     }
 
     return {

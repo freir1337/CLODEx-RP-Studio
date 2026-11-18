@@ -26,12 +26,26 @@ tavo.plugin.onSidebarAction('open-studio', async () => {
     tavo.plugin.emit('clodex-command', { action: 'open-tracker' });
 });
 
+tavo.plugin.onSidebarAction('open-forge', async () => {
+    tavo.plugin.emit('clodex-command', { action: 'open-forge' });
+});
+
 tavo.plugin.onSidebarAction('sync-tracker', async () => {
     tavo.plugin.emit('clodex-command', { action: 'sync-tracker' });
 });
 
 tavo.plugin.onSidebarAction('generate-bg', async () => {
     tavo.plugin.emit('clodex-command', { action: 'generate-bg' });
+});
+
+tavo.plugin.onLastMessageAction('speak-last-turn', async ({ messageId }) => {
+    const msg = messageId && tavo.message?.get
+        ? await tavo.message.get(messageId).catch(() => null)
+        : null;
+    tavo.plugin.emit('clodex-command', {
+        action: 'speak-reply',
+        text: String(msg?.content ?? ''),
+    });
 });
 
 tavo.plugin.onLastMessageAction('sync-last-turn', async ({ messageId }) => {

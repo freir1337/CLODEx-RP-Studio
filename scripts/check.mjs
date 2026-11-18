@@ -136,7 +136,7 @@ for (const rel of ['tavo/entry.js', 'tavo/ui/hud.js']) {
 }
 
 // Verify PNG icons & cover
-for (const pngRel of ['tavo/cover.png', 'tavo/icons/studio.png', 'tavo/icons/codex.png']) {
+for (const pngRel of ['tavo/cover.png', 'tavo/icons/studio.png', 'tavo/icons/codex.png', 'tavo/icons/voice.png']) {
     verifyPng(await readFile(resolve(root, pngRel)), pngRel);
 }
 

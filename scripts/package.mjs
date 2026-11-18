@@ -176,6 +176,7 @@ await writeWithDir(resolve(root, 'tavo/locales/ru.json'), `${JSON.stringify(RU_C
 // 2. Generate Tavo PNG assets (64x64 icons + 256x256 cover)
 await writeWithDir(resolve(root, 'tavo/icons/studio.png'), generateBadgePng(64, 64, [245, 158, 11], [139, 92, 246]));
 await writeWithDir(resolve(root, 'tavo/icons/codex.png'), generateBadgePng(64, 64, [16, 185, 129], [59, 130, 246]));
+await writeWithDir(resolve(root, 'tavo/icons/voice.png'), generateBadgePng(64, 64, [236, 72, 153], [245, 158, 11]));
 await writeWithDir(resolve(root, 'tavo/cover.png'), generateBadgePng(256, 256, [245, 158, 11], [139, 92, 246]));
 
 // 3. Bundle Tavo classic JS files & copy CSS
@@ -192,6 +193,9 @@ const tavoHudJs = await bundleClassicIife([
     'src/core/physiology.js',
     'src/core/prompts.js',
     'src/core/codex.js',
+    'src/core/voice.js',
+    'src/core/pngCard.js',
+    'src/core/forge.js',
     'src/core/hud.js',
     'src/tavo/hud.src.js',
 ]);
@@ -208,6 +212,7 @@ const tavoFiles = [
     'cover.png',
     'icons/studio.png',
     'icons/codex.png',
+    'icons/voice.png',
     'locales/en.json',
     'locales/ru.json',
     'ui/hud.html',
@@ -242,10 +247,13 @@ const stFiles = [
     'src/core/catalog.js',
     'src/core/codex.js',
     'src/core/date.js',
+    'src/core/forge.js',
     'src/core/hud.js',
     'src/core/localesData.js',
     'src/core/physiology.js',
+    'src/core/pngCard.js',
     'src/core/prompts.js',
+    'src/core/voice.js',
     'src/st/adapter.js',
 ];
 const stEntries = [];

@@ -11,6 +11,56 @@ export const COMPLICATION_POOL = Object.freeze([
     'none', 'morning_sickness', 'mild_anemia', 'fatigue_flare', 'blood_pressure_spike', 'back_strain',
 ]);
 
+export const METER_PRESET_PACKS = Object.freeze({
+    dark_romance: {
+        ru: [
+            { id: 'obsession', label: 'Одержимость', icon: '🖤', min: 0, max: 100, value: 25, showInHud: true },
+            { id: 'sin', label: 'Уровень греха', icon: '🕯', min: 0, max: 100, value: 10, showInHud: false },
+            { id: 'trust', label: 'Доверие', icon: '🤝', min: -100, max: 100, value: 0, showInHud: false },
+        ],
+        en: [
+            { id: 'obsession', label: 'Obsession', icon: '🖤', min: 0, max: 100, value: 25, showInHud: true },
+            { id: 'sin', label: 'Sin / Corruption', icon: '🕯', min: 0, max: 100, value: 10, showInHud: false },
+            { id: 'trust', label: 'Trust', icon: '🤝', min: -100, max: 100, value: 0, showInHud: false },
+        ],
+    },
+    fantasy_rpg: {
+        ru: [
+            { id: 'sanity', label: 'Рассудок', icon: '🧠', min: 0, max: 100, value: 90, showInHud: true },
+            { id: 'mana', label: 'Мана / Вера', icon: '✨', min: 0, max: 100, value: 80, showInHud: false },
+            { id: 'gold', label: 'Золото', icon: '🪙', min: 0, max: 9999, value: 50, showInHud: false },
+        ],
+        en: [
+            { id: 'sanity', label: 'Sanity', icon: '🧠', min: 0, max: 100, value: 90, showInHud: true },
+            { id: 'mana', label: 'Mana / Faith', icon: '✨', min: 0, max: 100, value: 80, showInHud: false },
+            { id: 'gold', label: 'Gold', icon: '🪙', min: 0, max: 9999, value: 50, showInHud: false },
+        ],
+    },
+    detective: {
+        ru: [
+            { id: 'suspicion', label: 'Подозрение', icon: '👁', min: 0, max: 100, value: 15, showInHud: true },
+            { id: 'clues', label: 'Улики', icon: '📂', min: 0, max: 20, value: 0, showInHud: false },
+        ],
+        en: [
+            { id: 'suspicion', label: 'Suspicion', icon: '👁', min: 0, max: 100, value: 15, showInHud: true },
+            { id: 'clues', label: 'Clues Found', icon: '📂', min: 0, max: 20, value: 0, showInHud: false },
+        ],
+    },
+});
+
+export function applyMeterPresetPack(state, packId, locale = 'ru') {
+    const pack = METER_PRESET_PACKS[packId];
+    if (!pack) return state;
+    const lang = String(locale).toLowerCase().startsWith('ru') ? 'ru' : 'en';
+    for (const tpl of pack[lang]) {
+        if (state.customMeters.length >= 8) break;
+        if (!state.customMeters.some(m => m.id === tpl.id)) {
+            state.customMeters.push({ ...tpl });
+        }
+    }
+    return state;
+}
+
 const clamp = (val, min, max) => Math.min(max, Math.max(min, Number.isFinite(val) ? val : min));
 
 export function defaultRng() {
@@ -100,6 +150,11 @@ export function createChatState(initialDate = '2026-09-01') {
             char: createEntityState('char'),
         },
         offspring: [],    // [{ id, name, parentRole, originMode, gender, bornDate, notes }]
+        customMeters: [], // [{ id, label, icon, min, max, value, showInHud }]
+        inventory: {
+            char: [],     // ['Silver Crucifix', ...]
+            user: [],
+        },
         scene: {
             imagePath: '',
             imagePrompt: '',
@@ -107,6 +162,7 @@ export function createChatState(initialDate = '2026-09-01') {
             videoTaskId: '',
             videoStatus: 'idle',
             turnsSinceAutoImage: 0,
+            lastAudioPath: '',
         },
         codexHistory: [], // [{ role: 'user'|'assistant', content, preset, model, at }]
         activityLog: [],  // [{ atDate, summary }]
@@ -217,6 +273,32 @@ export function normalizeChatState(raw) {
         out.scene.videoTaskId = String(raw.scene.videoTaskId ?? '').slice(0, 200);
         out.scene.videoStatus = String(raw.scene.videoStatus || 'idle').slice(0, 40);
         out.scene.turnsSinceAutoImage = Math.max(0, Math.trunc(Number(raw.scene.turnsSinceAutoImage) || 0));
+        out.scene.lastAudioPath = String(raw.scene.lastAudioPath ?? '').slice(0, 500);
+    }
+    if (Array.isArray(raw.customMeters)) {
+        out.customMeters = raw.customMeters.slice(0, 8).map((m, idx) => {
+            const min = Number.isFinite(Number(m.min)) ? Math.trunc(Number(m.min)) : 0;
+            const max = Number.isFinite(Number(m.max)) && Number(m.max) > min ? Math.trunc(Number(m.max)) : min + 100;
+            return {
+                id: String(m.id || `meter_${idx + 1}`).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40) || `meter_${idx + 1}`,
+                label: String(m.label ?? '').trim().slice(0, 60) || `Meter ${idx + 1}`,
+                icon: String(m.icon ?? '📊').trim().slice(0, 8) || '📊',
+                min,
+                max,
+                value: Math.round(clamp(Number(m.value) || 0, min, max)),
+                showInHud: Boolean(m.showInHud),
+            };
+        });
+    }
+    if (raw.inventory && typeof raw.inventory === 'object') {
+        for (const role of ['char', 'user']) {
+            if (Array.isArray(raw.inventory[role])) {
+                out.inventory[role] = raw.inventory[role]
+                    .map(item => String(item ?? '').trim().slice(0, 80))
+                    .filter(Boolean)
+                    .slice(0, 20);
+            }
+        }
     }
     if (Array.isArray(raw.codexHistory)) {
         out.codexHistory = raw.codexHistory.slice(-24).map(item => ({
@@ -636,6 +718,35 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
             if (ed.eggsHatched && bio.mode === 'oviposition' && bio.nest.active) {
                 hatchReadyEggs(entity, state, { forceAll: true });
             }
+        }
+    }
+
+    // Update custom meters if present
+    if (delta.customMeters && typeof delta.customMeters === 'object') {
+        for (const meter of state.customMeters) {
+            const nextVal = Number(delta.customMeters[meter.id]);
+            if (Number.isFinite(nextVal)) {
+                meter.value = Math.round(clamp(nextVal, meter.min, meter.max));
+            }
+        }
+    }
+
+    // Update inventory additions & removals
+    for (const role of ['char', 'user']) {
+        const added = delta.inventoryAdd?.[role];
+        if (Array.isArray(added)) {
+            for (const rawItem of added) {
+                const item = String(rawItem ?? '').trim().slice(0, 80);
+                if (item && state.inventory[role].length < 20
+                    && !state.inventory[role].some(x => x.toLowerCase() === item.toLowerCase())) {
+                    state.inventory[role].push(item);
+                }
+            }
+        }
+        const removed = delta.inventoryRemove?.[role];
+        if (Array.isArray(removed) && removed.length) {
+            const lowerRem = new Set(removed.map(x => String(x ?? '').trim().toLowerCase()));
+            state.inventory[role] = state.inventory[role].filter(x => !lowerRem.has(x.toLowerCase()));
         }
     }
 

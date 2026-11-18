@@ -1,6 +1,6 @@
 {
   "name": "clodex-rp-studio",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "CLODEx RP Studio — Physiology & 18+ Biology Tracker, Lore Navigator (Codex), and Live Scene Backgrounds/Video for Tavo AI (.tpg) and SillyTavern",

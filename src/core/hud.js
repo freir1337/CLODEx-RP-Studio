@@ -1,13 +1,16 @@
-import { base64ToBlob, blobToBase64, ClodexApi, redact, validateKey } from './api.js';
+import { base64ToBlob, blobToBase64, bytesToBase64, ClodexApi, redact, validateKey } from './api.js';
 import { normalizeCatalog, pickRecommendedModels, priceView, videoBillingView, walletView } from './catalog.js';
 import { buildCodexMessages, CODEX_PRESETS } from './codex.js';
 import { formatShortDate, TIME_SLOTS } from './date.js';
+import { buildForgePromptMessages, FORGE_CONCEPT_CHIPS, parseForgedCardV2 } from './forge.js';
 import {
-    advanceSimulationDays, applyTurnExtraction, BIO_MODES, BOND_TYPES, CONTRACEPTION_TYPES,
-    deliverBabies, DISCLOSURE_MODES, getCyclePhase, getVisibleBiologySummary, hatchReadyEggs,
-    layEggs, OMEGA_ROLES, SUPPRESSANT_LEVELS, triggerConception,
+    advanceSimulationDays, applyMeterPresetPack, applyTurnExtraction, BIO_MODES, BOND_TYPES,
+    CONTRACEPTION_TYPES, deliverBabies, DISCLOSURE_MODES, getCyclePhase, getVisibleBiologySummary,
+    hatchReadyEggs, layEggs, OMEGA_ROLES, SUPPRESSANT_LEVELS, triggerConception,
 } from './physiology.js';
+import { embedCharacterCardInPng } from './pngCard.js';
 import { buildSceneVisualPromptMessages, buildTrackerExtractionMessages, parseTrackerExtraction } from './prompts.js';
+import { extractSpokenDialogue, isSafeVoiceId, normalizeVoices } from './voice.js';
 
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -51,6 +54,18 @@ export function createRpStudioController(bridge) {
     let scenePromptDraft = '';
     let woundDraft = '';
     let woundBleedingDraft = true;
+    let meterNameDraft = '';
+    let meterIconDraft = '🖤';
+    let invItemDraft = '';
+
+    let voiceList = [];
+    let activeAudioUrl = '';
+
+    let forgeConcept = '';
+    let forgeLang = bridge.getLocale() === 'ru' ? 'ru' : 'en';
+    let forgeLoreCount = 5;
+    let forgeStatusText = '';
+    let forgedArtifact = null; // { card, pngBytes, base64Png, previewDataUrl, fileName }
 
     let catalog = [];
     let wallet = null;
@@ -250,6 +265,12 @@ export function createRpStudioController(bridge) {
                 bioLabel = `${icon} D${b.cycleDay} · ${t(`bio.phase.${phase}`)}`;
             }
             chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, bioLabel));
+        }
+
+        if (Array.isArray(state.customMeters)) {
+            for (const m of state.customMeters.filter(item => item.showInHud).slice(0, 2)) {
+                chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, `${m.icon} ${m.label}: ${m.value}`));
+            }
         }
 
         if (state.world.pendingMemoryHint) {
@@ -534,6 +555,172 @@ export function createRpStudioController(bridge) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
         } finally {
             if (activeAbort === abort) activeAbort = null;
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function loadSpeechVoices() {
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return [];
+        }
+        if (!catalog.length) await refreshAccount();
+        const model = bridge.getSettings().speechModel;
+        if (!model) {
+            errorBanner = 'Select a Voice (TTS) model in Key & Models.';
+            renderAll();
+            return [];
+        }
+        busyState = 'voices';
+        errorBanner = '';
+        renderAll();
+        try {
+            const payload = await api.voices(model);
+            voiceList = normalizeVoices(payload);
+            return voiceList;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, key);
+            return [];
+        } finally {
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function speakLatestReply({ explicitText = '', auto = false } = {}) {
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            if (!auto) {
+                activeTab = 'account';
+                toggleDrawer(true);
+            }
+            return '';
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.speechModel;
+        if (!model) {
+            if (!auto) errorBanner = 'Select a Voice (TTS) model in Key & Models.';
+            renderAll();
+            return '';
+        }
+
+        const rp = await bridge.getRpContext();
+        const rawSource = explicitText || rp.recentMessages?.filter(m => m.role === 'assistant').at(-1)?.content || '';
+        const spoken = extractSpokenDialogue(rawSource, { dialogueOnly: settings.dialogueOnly !== false });
+        if (!spoken) {
+            if (!auto) errorBanner = t('voice.noDialogue');
+            renderAll();
+            return '';
+        }
+
+        const charVoice = settings.voiceMap?.[rp.charName] || settings.defaultVoice || 'alloy';
+        const safeVoice = isSafeVoiceId(charVoice) ? charVoice : 'alloy';
+
+        if (!auto && settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'TTS', model }));
+            if (!ok) return '';
+        }
+
+        busyState = 'tts';
+        errorBanner = '';
+        renderAll();
+        try {
+            const audioBlob = await api.speech({ model, input: spoken, voice: safeVoice });
+            const base64 = await blobToBase64(audioBlob);
+            let savedPath = '';
+            if (bridge.saveSpeechAudio) {
+                savedPath = await bridge.saveSpeechAudio({ blob: audioBlob, base64 });
+            } else if (typeof URL?.createObjectURL === 'function') {
+                if (activeAudioUrl) URL.revokeObjectURL(activeAudioUrl);
+                activeAudioUrl = URL.createObjectURL(audioBlob);
+                savedPath = activeAudioUrl;
+            }
+            const state = bridge.getChatState();
+            state.scene.lastAudioPath = savedPath;
+            await bridge.saveChatState(state);
+            bridge.playAudioPreview?.(savedPath, audioBlob);
+            await refreshAccount().catch(() => {});
+            return savedPath;
+        } catch (err) {
+            if (!auto) errorBanner = redact(err?.message ?? err, key);
+            return '';
+        } finally {
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function runCharacterForge() {
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return null;
+        }
+        if (!forgeConcept.trim()) return null;
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const textModel = settings.codexModel || settings.trackerModel;
+        const imageModel = settings.imageModel;
+        if (!textModel || !imageModel) {
+            errorBanner = 'Select Text and Image (Nano Banana) models in Key & Models.';
+            renderAll();
+            return null;
+        }
+        if (settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', {
+                kind: 'Character + Avatar',
+                model: `${textModel} + ${imageModel}`,
+            }));
+            if (!ok) return null;
+        }
+
+        busyState = 'forge';
+        forgeStatusText = t('forge.generatingCard');
+        errorBanner = '';
+        renderAll();
+        try {
+            const msgs = buildForgePromptMessages({
+                concept: forgeConcept,
+                language: forgeLang,
+                loreCount: forgeLoreCount,
+            });
+            const cardJsonRaw = await api.chat({ model: textModel, messages: msgs, temperature: 0.7, maxTokens: 2800, jsonMode: true });
+            const { card, avatarPrompt } = parseForgedCardV2(cardJsonRaw);
+
+            forgeStatusText = t('forge.generatingAvatar');
+            renderAll();
+            const imgRes = await api.image({ model: imageModel, prompt: avatarPrompt });
+            const imgBlob = imgRes.b64_json
+                ? base64ToBlob(imgRes.b64_json, 'image/png')
+                : await api.downloadImage(imgRes.url);
+            const rawPngBytes = new Uint8Array(await imgBlob.arrayBuffer());
+            const embeddedPngBytes = embedCharacterCardInPng(rawPngBytes, card);
+            const base64Png = bytesToBase64(embeddedPngBytes);
+            const slug = card.data.name.toLowerCase().replace(/[^a-z0-9а-яё_-]+/giu, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'character';
+
+            forgedArtifact = {
+                card,
+                pngBytes: embeddedPngBytes,
+                base64Png,
+                previewDataUrl: `data:image/png;base64,${base64Png}`,
+                fileName: `${slug}-clodex-card.png`,
+            };
+            forgeStatusText = t('forge.doneStatus', {
+                name: card.data.name,
+                count: card.data.character_book?.entries?.length ?? 0,
+            });
+            await refreshAccount().catch(() => {});
+            return forgedArtifact;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, key);
+            forgeStatusText = '';
+            return null;
+        } finally {
             busyState = '';
             renderAll();
         }
@@ -1230,6 +1417,145 @@ export function createRpStudioController(bridge) {
             container.append(bioCard);
         }
 
+        // Custom Story Meters & Inventory Card
+        const metersCard = el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `📊 ${t('meters.title')}`),
+            el(doc, 'div', { className: 'clodex-rp-chips' },
+                ...[
+                    ['dark_romance', t('meters.packDark')],
+                    ['fantasy_rpg', t('meters.packRpg')],
+                    ['detective', t('meters.packDetective')],
+                ].map(([packId, label]) => el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-chip-btn',
+                    onClick: async () => {
+                        applyMeterPresetPack(state, packId, bridge.getLocale());
+                        await bridge.saveChatState(state);
+                        renderAll();
+                    },
+                }, label)),
+            ),
+            state.customMeters.length === 0
+                ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('meters.empty'))
+                : el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' },
+                    ...state.customMeters.map(meter => el(doc, 'div', { className: 'clodex-rp-subbox' },
+                        el(doc, 'div', { className: 'clodex-rp-list-item' },
+                            el(doc, 'strong', {}, `${meter.icon} ${meter.label}: ${meter.value} / ${meter.max}`),
+                            el(doc, 'div', { className: 'clodex-rp-head-actions' },
+                                el(doc, 'label', { className: 'clodex-rp-check' },
+                                    el(doc, 'input', {
+                                        type: 'checkbox',
+                                        checked: meter.showInHud,
+                                        onChange: async e => {
+                                            meter.showInHud = e.target.checked;
+                                            await bridge.saveChatState(state);
+                                            renderHudPill();
+                                        },
+                                    }),
+                                    el(doc, 'span', {}, t('meters.pinHud')),
+                                ),
+                                el(doc, 'button', {
+                                    type: 'button',
+                                    className: 'clodex-rp-btn-mini',
+                                    onClick: async () => {
+                                        state.customMeters = state.customMeters.filter(m => m.id !== meter.id);
+                                        await bridge.saveChatState(state);
+                                        renderAll();
+                                    },
+                                }, '✕'),
+                            ),
+                        ),
+                        el(doc, 'input', {
+                            type: 'range',
+                            min: meter.min,
+                            max: meter.max,
+                            value: meter.value,
+                            onChange: async e => {
+                                meter.value = Number(e.target.value) || 0;
+                                await bridge.saveChatState(state);
+                                renderAll();
+                            },
+                        }),
+                    ))),
+            state.customMeters.length < 8 ? el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                el(doc, 'input', {
+                    type: 'text',
+                    className: 'clodex-rp-input',
+                    style: 'max-width:64px',
+                    placeholder: t('meters.iconPlaceholder'),
+                    value: meterIconDraft,
+                    onInput: e => { meterIconDraft = e.target.value; },
+                }),
+                el(doc, 'input', {
+                    type: 'text',
+                    className: 'clodex-rp-input',
+                    style: 'flex:1',
+                    placeholder: t('meters.namePlaceholder'),
+                    value: meterNameDraft,
+                    onInput: e => { meterNameDraft = e.target.value; },
+                }),
+                el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn',
+                    onClick: async () => {
+                        const cleanLabel = meterNameDraft.trim().slice(0, 50);
+                        if (!cleanLabel) return;
+                        const id = cleanLabel.toLowerCase().replace(/[^a-z0-9]+/g, '_') || `m_${Date.now()}`;
+                        state.customMeters.push({
+                            id: `${id}_${state.customMeters.length + 1}`,
+                            label: cleanLabel,
+                            icon: meterIconDraft.trim().slice(0, 6) || '📊',
+                            min: 0,
+                            max: 100,
+                            value: 50,
+                            showInHud: state.customMeters.length === 0,
+                        });
+                        meterNameDraft = '';
+                        await bridge.saveChatState(state);
+                        renderAll();
+                    },
+                }, t('meters.addBtn')),
+            ) : null,
+            el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+                el(doc, 'strong', {}, `🎒 ${t('inv.title')} (${t(`entity.${activeEntityRole}`)})`),
+                (state.inventory?.[activeEntityRole]?.length ?? 0) === 0
+                    ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('inv.empty'))
+                    : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                        ...state.inventory[activeEntityRole].map(item => el(doc, 'button', {
+                            type: 'button',
+                            className: 'clodex-rp-chip-btn',
+                            onClick: async () => {
+                                state.inventory[activeEntityRole] = state.inventory[activeEntityRole].filter(x => x !== item);
+                                await bridge.saveChatState(state);
+                                renderDrawer();
+                            },
+                        }, `${item} ✕`))),
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    el(doc, 'input', {
+                        type: 'text',
+                        className: 'clodex-rp-input',
+                        style: 'flex:1',
+                        placeholder: t('inv.itemPlaceholder'),
+                        value: invItemDraft,
+                        onInput: e => { invItemDraft = e.target.value; },
+                    }),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        onClick: async () => {
+                            const val = invItemDraft.trim().slice(0, 80);
+                            if (!val) return;
+                            state.inventory[activeEntityRole].push(val);
+                            invItemDraft = '';
+                            await bridge.saveChatState(state);
+                            renderDrawer();
+                        },
+                    }, t('inv.addBtn')),
+                ),
+            ),
+        );
+        container.append(metersCard);
+
         return container;
     }
 
@@ -1493,6 +1819,179 @@ export function createRpStudioController(bridge) {
                 ),
             ),
         ));
+
+        // Character Voice (CLODEx TTS) Card
+        const audioSrc = bridge.resolveMediaSrc?.(state.scene.lastAudioPath) || state.scene.lastAudioPath || '';
+        const currentVoice = settings.defaultVoice || 'alloy';
+        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `🔊 ${t('voice.title')}`),
+            el(doc, 'div', { className: 'clodex-rp-grid-2' },
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('voice.voiceSelect')),
+                    voiceList.length > 0
+                        ? buildSelect(
+                            voiceList.map(v => ({ value: v.id, label: v.name })),
+                            currentVoice,
+                            async val => {
+                                await bridge.updateSettings({ defaultVoice: val });
+                                renderDrawer();
+                            },
+                        )
+                        : el(doc, 'input', {
+                            type: 'text',
+                            className: 'clodex-rp-input',
+                            placeholder: t('voice.voicePlaceholder'),
+                            value: currentVoice,
+                            onChange: async e => {
+                                await bridge.updateSettings({ defaultVoice: e.target.value.trim() || 'alloy' });
+                            },
+                        }),
+                ),
+                el(doc, 'div', { className: 'clodex-rp-btn-row', style: 'align-self:flex-end' },
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        disabled: busyState === 'voices',
+                        onClick: () => loadSpeechVoices(),
+                    }, `🎙 ${t('voice.loadVoices')}`),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-primary',
+                        disabled: busyState === 'tts',
+                        onClick: () => speakLatestReply({ auto: false }),
+                    }, busyState === 'tts' ? `⏳ ${t('voice.speaking')}` : `🔊 ${t('voice.speakLastBtn')}`),
+                ),
+            ),
+            el(doc, 'label', { className: 'clodex-rp-check clodex-rp-mt' },
+                el(doc, 'input', {
+                    type: 'checkbox',
+                    checked: settings.dialogueOnly !== false,
+                    onChange: async e => {
+                        await bridge.updateSettings({ dialogueOnly: e.target.checked });
+                    },
+                }),
+                el(doc, 'span', {}, t('voice.dialogueOnly')),
+            ),
+            audioSrc ? el(doc, 'audio', {
+                className: 'clodex-rp-audio',
+                controls: true,
+                autoplay: true,
+                src: audioSrc,
+            }) : null,
+        ));
+
+        return container;
+    }
+
+    function renderForgeTab() {
+        const locale = bridge.getLocale();
+        const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+
+        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `⚒️ ${t('forge.title')}`),
+            el(doc, 'p', { className: 'clodex-rp-muted' }, t('forge.subtitle')),
+            el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                ...[
+                    [FORGE_CONCEPT_CHIPS[0], t('forge.chipDante')],
+                    [FORGE_CONCEPT_CHIPS[1], t('forge.chipDuke')],
+                    [FORGE_CONCEPT_CHIPS[2], t('forge.chipMedic')],
+                ].map(([chip, label]) => el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-chip-btn',
+                    onClick: () => {
+                        forgeConcept = locale === 'ru' ? chip.ru : chip.en;
+                        forgeLang = locale;
+                        renderDrawer();
+                    },
+                }, label)),
+            ),
+            el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                el(doc, 'span', {}, t('forge.conceptLabel')),
+                el(doc, 'textarea', {
+                    className: 'clodex-rp-input',
+                    rows: 4,
+                    placeholder: t('forge.conceptPlaceholder'),
+                    value: forgeConcept,
+                    onInput: e => { forgeConcept = e.target.value; },
+                }),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('forge.langLabel')),
+                    buildSelect(
+                        [{ value: 'ru', label: 'Русский (RU)' }, { value: 'en', label: 'English (EN)' }],
+                        forgeLang,
+                        val => { forgeLang = val; },
+                    ),
+                ),
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, `${t('forge.loreCountLabel')}: ${forgeLoreCount}`),
+                    el(doc, 'input', {
+                        type: 'range',
+                        min: 2,
+                        max: 8,
+                        value: forgeLoreCount,
+                        onChange: e => {
+                            forgeLoreCount = Number(e.target.value) || 5;
+                            renderDrawer();
+                        },
+                    }),
+                ),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn clodex-rp-btn-primary',
+                    disabled: busyState === 'forge',
+                    onClick: () => runCharacterForge(),
+                }, busyState === 'forge' ? `⏳ ${forgeStatusText}` : `🔥 ${t('forge.generateBtn')}`),
+            ),
+            forgeStatusText && busyState !== 'forge'
+                ? el(doc, 'div', { className: 'clodex-rp-badge-line clodex-rp-mt' }, `✨ ${forgeStatusText}`)
+                : null,
+        ));
+
+        if (forgedArtifact) {
+            const d = forgedArtifact.card.data;
+            container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+                el(doc, 'div', { className: 'clodex-rp-forge-card' },
+                    el(doc, 'img', {
+                        className: 'clodex-rp-forge-avatar',
+                        src: forgedArtifact.previewDataUrl,
+                        alt: d.name,
+                    }),
+                    el(doc, 'div', { style: 'flex:1;min-width:0' },
+                        el(doc, 'strong', {}, d.name),
+                        el(doc, 'p', { className: 'clodex-rp-muted' }, `${d.personality.slice(0, 140)}…`),
+                        el(doc, 'div', { className: 'clodex-rp-muted' },
+                            `📚 ${d.character_book?.name || 'Lorebook'} (${d.character_book?.entries?.length ?? 0})`),
+                    ),
+                ),
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    bridge.importForgedCharacter ? el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-primary',
+                        onClick: async () => {
+                            try {
+                                await bridge.importForgedCharacter(forgedArtifact);
+                                bridge.notify?.(t('forge.importedNotice'));
+                            } catch (err) {
+                                errorBanner = redact(err?.message ?? err);
+                                renderDrawer();
+                            }
+                        },
+                    }, `📥 ${t('forge.importBtn')}`) : null,
+                    bridge.exportForgedCharacter ? el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        onClick: async () => {
+                            await bridge.exportForgedCharacter(forgedArtifact);
+                        },
+                    }, `💾 ${t('forge.downloadPngBtn')}`) : null,
+                ),
+            ));
+        }
+
         return container;
     }
 
@@ -1505,6 +2004,7 @@ export function createRpStudioController(bridge) {
         const textModels = catalog.filter(m => m.kinds.includes('text') || !m.kinds.length);
         const imageModels = catalog.filter(m => m.kinds.includes('image'));
         const videoModels = catalog.filter(m => m.kinds.includes('video'));
+        const speechModels = catalog.filter(m => m.kinds.includes('speech'));
 
         const modelOptions = (list, current) => {
             const opts = list.map(m => ({
@@ -1578,6 +2078,12 @@ export function createRpStudioController(bridge) {
                         await bridge.updateSettings({ videoModel: v });
                     }),
                 ),
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('account.speechModel')),
+                    buildSelect(modelOptions(speechModels.length ? speechModels : catalog, settings.speechModel), settings.speechModel, async v => {
+                        await bridge.updateSettings({ speechModel: v });
+                    }),
+                ),
             ),
             el(doc, 'div', { className: 'clodex-rp-toggles clodex-rp-mt' },
                 el(doc, 'label', { className: 'clodex-rp-check' },
@@ -1587,6 +2093,14 @@ export function createRpStudioController(bridge) {
                         onChange: async e => { await bridge.updateSettings({ autoTrack: e.target.checked }); },
                     }),
                     el(doc, 'span', {}, t('account.autoTrack')),
+                ),
+                el(doc, 'label', { className: 'clodex-rp-check' },
+                    el(doc, 'input', {
+                        type: 'checkbox',
+                        checked: Boolean(settings.autoSpeak),
+                        onChange: async e => { await bridge.updateSettings({ autoSpeak: e.target.checked }); },
+                    }),
+                    el(doc, 'span', {}, t('account.autoSpeak')),
                 ),
                 el(doc, 'label', { className: 'clodex-rp-check' },
                     el(doc, 'input', {
@@ -1619,13 +2133,15 @@ export function createRpStudioController(bridge) {
             ['tracker', `🧬 ${t('tab.tracker')}`],
             ['codex', `📜 ${t('tab.codex')}`],
             ['scene', `🍌 ${t('tab.scene')}`],
+            ['forge', `⚒️ ${t('tab.forge')}`],
             ['account', `🔑 ${t('tab.account')}`],
         ];
 
         const body = activeTab === 'codex' ? renderCodexTab(state)
             : activeTab === 'scene' ? renderSceneTab(state)
-                : activeTab === 'account' ? renderAccountTab()
-                    : renderTrackerTab(state);
+                : activeTab === 'forge' ? renderForgeTab()
+                    : activeTab === 'account' ? renderAccountTab()
+                        : renderTrackerTab(state);
 
         drawerPanel.replaceChildren(
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
@@ -1669,12 +2185,16 @@ export function createRpStudioController(bridge) {
     async function onAssistantMessageCommitted({ checkpointKey = '' } = {}) {
         const settings = bridge.getSettings();
         const state = bridge.getChatState();
+
         if (state.world.pendingMemoryHint) {
             state.world.pendingMemoryHint = '';
             await bridge.saveChatState(state);
         }
         if (settings.autoTrack !== false && bridge.getEffectiveKey()) {
             await syncTrackerFromChat({ checkpointKey, silent: true });
+        }
+        if (settings.autoSpeak === true && bridge.getEffectiveKey()) {
+            await speakLatestReply({ auto: true });
         }
         const autoEvery = Number(settings.autoImageEvery || 0);
         if (autoEvery > 0 && bridge.getEffectiveKey()) {
@@ -1712,10 +2232,13 @@ export function createRpStudioController(bridge) {
         toggleDrawer,
         syncTrackerFromChat,
         generateSceneBackground,
+        speakLatestReply,
+        runCharacterForge,
         onAssistantMessageCommitted,
         refreshAccount,
         dispose() {
             activeAbort?.abort();
+            if (activeAudioUrl) URL.revokeObjectURL(activeAudioUrl);
             unsubLocale?.();
             unsubInsets?.();
             win.removeEventListener?.('resize', onResize);

@@ -91,7 +91,8 @@ export async function readMediaBlob(response, expectedType, maxBytes = MAX_MEDIA
         throw new ApiError('Invalid or oversized media payload.', { code: 'invalid_media' });
     }
     const finalType = contentType.startsWith(`${expectedType}/`) ? contentType
-        : expectedType === 'video' ? 'video/mp4' : 'image/png';
+        : expectedType === 'video' ? 'video/mp4'
+            : expectedType === 'audio' ? 'audio/mpeg' : 'image/png';
     return blob.type === finalType ? blob : new Blob([blob], { type: finalType });
 }
 
@@ -193,6 +194,25 @@ export class ClodexApi {
 
     status(signal) {
         return this.request('/api/status', { signal, auth: false, timeout: 15_000 });
+    }
+
+    voices(model, { search = '', page = 1, signal } = {}) {
+        if (!model) throw new ApiError('Select a CLODEx speech model first.', { code: 'model_required' });
+        const query = new URLSearchParams({ model, search, page: String(page), page_size: '100' });
+        return this.request(`/v1/audio/voices?${query}`, { signal, timeout: 30_000 });
+    }
+
+    speech({ model, input, voice = 'alloy' }, signal) {
+        if (!model) throw new ApiError('Select a CLODEx speech model first.', { code: 'model_required' });
+        const text = String(input ?? '').trim();
+        if (!text) throw new ApiError('Speech text is empty.', { code: 'empty_input' });
+        return this.request('/v1/audio/speech', {
+            method: 'POST',
+            body: { model, input: text.slice(0, 8000), voice: String(voice || 'alloy'), response_format: 'mp3' },
+            blob: 'audio',
+            signal,
+            timeout: 120_000,
+        });
     }
 
     async chat({ model, messages, temperature = 0.25, maxTokens = 600, jsonMode = false }, signal) {

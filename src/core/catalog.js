@@ -52,7 +52,8 @@ export function pickRecommendedModels(catalog, current = {}) {
     const textModels = catalog.filter(m => m.kinds.includes('text'));
     const imageModels = catalog.filter(m => m.kinds.includes('image'));
     const videoModels = catalog.filter(m => m.kinds.includes('video'));
-    const has = (list, id) => Boolean(id && list.some(m => m.id === id || m.id === id));
+    const speechModels = catalog.filter(m => m.kinds.includes('speech'));
+    const has = (list, id) => Boolean(id && list.some(m => m.id === id));
 
     const trackerModel = has(catalog, current.trackerModel) ? current.trackerModel
         : (textModels.find(m => /flash-lite|ministral|mistral-small|gpt-4o-mini|gpt-4\.1-mini|haiku|flash/i.test(m.id))
@@ -70,7 +71,11 @@ export function pickRecommendedModels(catalog, current = {}) {
     const videoModel = has(catalog, current.videoModel) ? current.videoModel
         : videoModels[0]?.id ?? '';
 
-    return { trackerModel, codexModel, imageModel, videoModel };
+    const speechModel = has(catalog, current.speechModel) ? current.speechModel
+        : (speechModels.find(m => /eleven|tts-1|gpt-4o-mini-tts/i.test(m.id))
+            ?? speechModels[0])?.id ?? '';
+
+    return { trackerModel, codexModel, imageModel, videoModel, speechModel };
 }
 
 export function priceView(price) {

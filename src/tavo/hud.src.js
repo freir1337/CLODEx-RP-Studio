@@ -17,6 +17,11 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
         codexModel: '',
         imageModel: '',
         videoModel: '',
+        speechModel: '',
+        defaultVoice: 'alloy',
+        dialogueOnly: true,
+        autoSpeak: false,
+        voiceMap: {},
         autoTrack: tavo.plugin.config.get('autoTrack') !== false,
         injectContext: tavo.plugin.config.get('injectContext') !== false,
         confirmPaid: tavo.plugin.config.get('confirmPaid') !== false,
@@ -137,6 +142,34 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
             const b64 = await tavo.file.load(target, { encoding: 'base64' }).catch(() => null);
             return b64 ? `data:image/png;base64,${b64}` : '';
         },
+        async saveSpeechAudio({ base64 }) {
+            const prev = cachedState.scene?.lastAudioPath;
+            const nextName = prev?.endsWith('tts-a.mp3') ? 'clodex-rp-tts-b.mp3' : 'clodex-rp-tts-a.mp3';
+            const oldName = nextName === 'clodex-rp-tts-a.mp3' ? 'clodex-rp-tts-b.mp3' : 'clodex-rp-tts-a.mp3';
+            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64' });
+            await tavo.file.delete(oldName).catch(() => {});
+            return savedPath;
+        },
+        playAudioPreview(path) {
+            if (!path || typeof Audio !== 'function') return;
+            const audio = new Audio(path);
+            audio.play().catch(() => {});
+        },
+        async importForgedCharacter({ base64Png, fileName, card }) {
+            const safeName = String(fileName || 'clodex-forged-card.png').replace(/[^a-zA-Z0-9._-]/g, '_');
+            if (tavo.file?.save && tavo.character?.import) {
+                const savedPath = await tavo.file.save(safeName, base64Png, { encoding: 'base64' });
+                return await tavo.character.import(savedPath);
+            }
+            if (tavo.character?.import) {
+                return await tavo.character.import(card);
+            }
+            throw new Error('tavo.character.import is unavailable in this Tavo version.');
+        },
+        async exportForgedCharacter({ base64Png, fileName }) {
+            const safeName = String(fileName || 'clodex-forged-card.png').replace(/[^a-zA-Z0-9._-]/g, '_');
+            await tavo.file.export(safeName, base64Png, { encoding: 'base64' });
+        },
         loadHudPosition: () => cachedPrefs.hudPos,
         saveHudPosition(pos) {
             cachedPrefs.hudPos = pos;
@@ -162,10 +195,13 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
         const action = payload?.action;
         if (action === 'open-tracker') controller.openTab('tracker');
         else if (action === 'open-codex') controller.openTab('codex');
+        else if (action === 'open-forge') controller.openTab('forge');
         else if (action === 'sync-tracker') {
             await controller.syncTrackerFromChat({ checkpointKey: payload?.messageId || '' });
         } else if (action === 'generate-bg') {
             await controller.generateSceneBackground({ auto: false });
+        } else if (action === 'speak-reply') {
+            await controller.speakLatestReply({ explicitText: payload?.text || '', auto: false });
         }
     });
 
