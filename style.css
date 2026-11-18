@@ -1,0 +1,416 @@
+/* CLODEx RP Studio — Shared Mobile-First & Desktop Glassmorphic UI */
+:root {
+    --clodex-rp-bg: rgba(14, 17, 26, 0.94);
+    --clodex-rp-card: rgba(24, 29, 44, 0.88);
+    --clodex-rp-border: rgba(148, 163, 184, 0.2);
+    --clodex-rp-accent: #f59e0b;
+    --clodex-rp-accent-2: #8b5cf6;
+    --clodex-rp-text: #f1f5f9;
+    --clodex-rp-muted: #94a3b8;
+    --clodex-rp-danger: #ef4444;
+}
+
+.clodex-rp-video-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    pointer-events: none;
+    overflow: hidden;
+}
+
+.clodex-rp-video-el {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+.clodex-rp-video-dim {
+    position: absolute;
+    inset: 0;
+    background: rgba(8, 10, 16, 0.35);
+}
+
+.clodex-rp-hud-pill {
+    position: fixed;
+    top: calc(var(--tavo-inset-top-bar, 10px) + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 9990;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: calc(100vw - 20px);
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding: 6px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    background: rgba(13, 16, 25, 0.86);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    color: var(--clodex-rp-text);
+    font-size: 12px;
+    line-height: 1.2;
+    white-space: nowrap;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+}
+
+.clodex-rp-hud-pill::-webkit-scrollbar {
+    display: none;
+}
+
+.clodex-rp-hud-pill:active {
+    cursor: grabbing;
+}
+
+.clodex-rp-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.clodex-rp-chip-alert {
+    background: rgba(239, 68, 68, 0.25);
+    color: #fecaca;
+}
+
+.clodex-rp-chip-bio {
+    background: rgba(139, 92, 246, 0.22);
+    color: #ddd6fe;
+}
+
+.clodex-rp-chip-wallet,
+.clodex-rp-chip-key {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fde68a;
+}
+
+.clodex-rp-chip-codex {
+    background: rgba(16, 185, 129, 0.22);
+    color: #a7f3d0;
+}
+
+.clodex-rp-drawer-mask {
+    position: fixed;
+    top: var(--tavo-inset-top-bar, 0px);
+    bottom: var(--tavo-inset-bottom-safe, 0px);
+    left: 0;
+    right: 0;
+    z-index: 9995;
+    background: rgba(5, 7, 12, 0.62);
+    display: flex;
+    justify-content: center;
+    align-items: flex-start;
+    padding: 10px;
+}
+
+.clodex-rp-drawer {
+    width: min(640px, 100%);
+    max-height: calc(100vh - var(--tavo-inset-top-bar, 12px) - var(--tavo-inset-bottom-input, 20px) - 20px);
+    display: flex;
+    flex-direction: column;
+    border-radius: 16px;
+    border: 1px solid var(--clodex-rp-border);
+    background: var(--clodex-rp-bg);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    color: var(--clodex-rp-text);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.65);
+    overflow: hidden;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px;
+}
+
+.clodex-rp-drawer-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--clodex-rp-border);
+}
+
+.clodex-rp-brand {
+    font-size: 14px;
+    letter-spacing: 0.02em;
+    color: #fde68a;
+}
+
+.clodex-rp-head-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.clodex-rp-tabs {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--clodex-rp-border);
+    background: rgba(0, 0, 0, 0.2);
+}
+
+.clodex-rp-tab-btn {
+    padding: 7px 6px;
+    border-radius: 9px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--clodex-rp-muted);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.clodex-rp-tab-btn.active {
+    background: rgba(245, 158, 11, 0.16);
+    border-color: rgba(245, 158, 11, 0.4);
+    color: #fde68a;
+}
+
+.clodex-rp-tab-body {
+    padding: 12px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.clodex-rp-card {
+    background: var(--clodex-rp-card);
+    border: 1px solid var(--clodex-rp-border);
+    border-radius: 12px;
+    padding: 11px;
+}
+
+.clodex-rp-card-title {
+    margin: 0 0 8px 0;
+    font-size: 13px;
+    color: #f8fafc;
+}
+
+.clodex-rp-grid-2 {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+}
+
+@media (max-width: 520px) {
+    .clodex-rp-grid-2 {
+        grid-template-columns: 1fr;
+    }
+    .clodex-rp-tabs {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+.clodex-rp-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--clodex-rp-muted);
+}
+
+.clodex-rp-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 7px 9px;
+    border-radius: 8px;
+    border: 1px solid var(--clodex-rp-border);
+    background: rgba(10, 13, 22, 0.85);
+    color: var(--clodex-rp-text);
+    font-size: 13px;
+}
+
+.clodex-rp-btn-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    align-items: center;
+}
+
+.clodex-rp-btn,
+.clodex-rp-btn-mini,
+.clodex-rp-chip-btn {
+    border-radius: 8px;
+    border: 1px solid var(--clodex-rp-border);
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--clodex-rp-text);
+    padding: 7px 11px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.clodex-rp-btn-primary {
+    background: linear-gradient(135deg, rgba(245, 158, 11, 0.3), rgba(139, 92, 246, 0.3));
+    border-color: rgba(245, 158, 11, 0.55);
+    color: #fef3c7;
+    font-weight: 600;
+}
+
+.clodex-rp-btn-mini {
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
+.clodex-rp-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.clodex-rp-chip-btn {
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 11px;
+    background: rgba(139, 92, 246, 0.14);
+    border-color: rgba(139, 92, 246, 0.32);
+}
+
+.clodex-rp-seg {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.clodex-rp-seg-btn {
+    padding: 7px;
+    border-radius: 9px;
+    border: 1px solid var(--clodex-rp-border);
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--clodex-rp-muted);
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.clodex-rp-seg-btn.active {
+    border-color: rgba(139, 92, 246, 0.55);
+    background: rgba(139, 92, 246, 0.22);
+    color: #ede9fe;
+}
+
+.clodex-rp-toggles {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.clodex-rp-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--clodex-rp-text);
+    cursor: pointer;
+}
+
+.clodex-rp-subbox {
+    margin-top: 8px;
+    padding: 9px;
+    border-radius: 9px;
+    background: rgba(0, 0, 0, 0.24);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+}
+
+.clodex-rp-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.clodex-rp-list-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 7px;
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.clodex-rp-codex-feed {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 260px;
+    overflow-y: auto;
+    padding: 6px;
+}
+
+.clodex-rp-codex-msg {
+    padding: 9px 11px;
+    border-radius: 10px;
+    border: 1px solid var(--clodex-rp-border);
+    white-space: pre-wrap;
+    line-height: 1.45;
+}
+
+.clodex-rp-codex-msg.is-user {
+    align-self: flex-end;
+    background: rgba(245, 158, 11, 0.14);
+}
+
+.clodex-rp-codex-msg.is-assistant {
+    background: rgba(24, 29, 44, 0.95);
+}
+
+.clodex-rp-scene-preview {
+    border-radius: 10px;
+    overflow: hidden;
+    max-height: 200px;
+    border: 1px solid var(--clodex-rp-border);
+}
+
+.clodex-rp-preview-media {
+    width: 100%;
+    max-height: 200px;
+    object-fit: cover;
+    display: block;
+}
+
+.clodex-rp-banner {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 9px;
+    background: rgba(16, 185, 129, 0.16);
+    border: 1px solid rgba(16, 185, 129, 0.4);
+    font-size: 12px;
+}
+
+.clodex-rp-error {
+    margin: 8px 12px 0;
+    padding: 8px 10px;
+    border-radius: 9px;
+    background: rgba(239, 68, 68, 0.18);
+    border: 1px solid rgba(239, 68, 68, 0.45);
+    color: #fecaca;
+    font-size: 12px;
+}
+
+.clodex-rp-badge-line {
+    padding: 5px 9px;
+    border-radius: 8px;
+    background: rgba(139, 92, 246, 0.16);
+    font-size: 12px;
+}
+
+.clodex-rp-muted {
+    color: var(--clodex-rp-muted);
+    font-size: 12px;
+}
+
+.clodex-rp-mt {
+    margin-top: 8px;
+}

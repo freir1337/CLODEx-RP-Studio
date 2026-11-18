@@ -1,0 +1,137 @@
+{
+  "specVersion": 2,
+  "id": "xyz.clodex.rp-studio",
+  "name": { "$t": "plugin.name" },
+  "version": "1.0.0",
+  "minAppVersion": "0.93.0",
+  "entry": "entry.js",
+  "author": "CLODEx",
+  "description": { "$t": "plugin.description" },
+  "releaseNotes": { "$t": "releaseNotes.1_0_0" },
+  "localization": {
+    "defaultLocale": "en",
+    "resources": {
+      "en": "locales/en.json",
+      "ru": "locales/ru.json"
+    }
+  },
+  "cover": "cover.png",
+  "permissions": [
+    "input",
+    "message",
+    "generate",
+    "variable",
+    "file",
+    "network"
+  ],
+  "contributes": {
+    "inputActions": [
+      {
+        "id": "toggle-studio",
+        "label": { "$t": "actions.toggleStudio" },
+        "icon": "icons/studio.png"
+      },
+      {
+        "id": "ask-codex",
+        "label": { "$t": "actions.askCodex" },
+        "icon": "icons/codex.png"
+      }
+    ],
+    "sidebar": [
+      {
+        "id": "open-studio",
+        "label": { "$t": "actions.toggleStudio" }
+      },
+      {
+        "id": "sync-tracker",
+        "label": { "$t": "actions.syncTracker" }
+      },
+      {
+        "id": "generate-bg",
+        "label": { "$t": "actions.generateSceneBg" }
+      }
+    ],
+    "lastMessageActions": [
+      {
+        "id": "sync-last-turn",
+        "label": { "$t": "actions.syncTracker" },
+        "icon": "icons/studio.png",
+        "role": "character"
+      }
+    ],
+    "htmlFragments": [
+      {
+        "id": "clodex-rp-hud",
+        "src": "ui/hud.html",
+        "mount": "/chat/body/end"
+      }
+    ],
+    "settings": {
+      "schema": [
+        {
+          "type": "info",
+          "text": { "$t": "settings.info" },
+          "icon": "info"
+        },
+        {
+          "type": "header",
+          "label": { "$t": "settings.header.api" }
+        },
+        {
+          "key": "apiKey",
+          "type": "text",
+          "label": { "$t": "settings.apiKey.label" },
+          "placeholder": { "$t": "settings.apiKey.placeholder" },
+          "description": { "$t": "settings.apiKey.desc" },
+          "default": ""
+        },
+        {
+          "key": "autoTrack",
+          "type": "switch",
+          "label": { "$t": "settings.autoTrack.label" },
+          "description": { "$t": "settings.autoTrack.desc" },
+          "default": true
+        },
+        {
+          "key": "confirmPaid",
+          "type": "switch",
+          "label": { "$t": "settings.confirmPaid.label" },
+          "description": { "$t": "settings.confirmPaid.desc" },
+          "default": true
+        },
+        {
+          "type": "header",
+          "label": { "$t": "settings.header.modules" }
+        },
+        {
+          "key": "enableVitals",
+          "type": "switch",
+          "label": { "$t": "settings.enableVitals.label" },
+          "default": true
+        },
+        {
+          "key": "enableAdultBio",
+          "type": "switch",
+          "label": { "$t": "settings.enableAdultBio.label" },
+          "description": { "$t": "settings.enableAdultBio.desc" },
+          "default": false
+        },
+        {
+          "key": "injectContext",
+          "type": "switch",
+          "label": { "$t": "settings.injectContext.label" },
+          "default": true
+        },
+        {
+          "key": "bgDim",
+          "type": "slider",
+          "label": { "$t": "settings.bgDim.label" },
+          "min": 0,
+          "max": 80,
+          "step": 5,
+          "default": 35
+        }
+      ]
+    }
+  }
+}

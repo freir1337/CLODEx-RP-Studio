@@ -1,0 +1,21 @@
+{
+  "name": "clodex-rp-studio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "CLODEx RP Studio — Physiology & 18+ Biology Tracker, Lore Navigator (Codex), and Live Scene Backgrounds/Video for Tavo AI (.tpg) and SillyTavern",
+  "license": "MIT",
+  "homepage": "https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mereyabdenbekuly-ctrl/CLODEx-RP-Studio.git"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node scripts/check.mjs",
+    "package": "node scripts/package.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
