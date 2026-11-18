@@ -84,6 +84,11 @@
     color: #ddd6fe;
 }
 
+.clodex-rp-chip-cradle {
+    background: rgba(236, 72, 153, 0.22);
+    color: #fbcfe8;
+}
+
 .clodex-rp-chip-wallet,
 .clodex-rp-chip-key {
     background: rgba(245, 158, 11, 0.2);
@@ -130,32 +135,38 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    padding: 10px 14px;
+    gap: 8px;
+    padding: 9px 12px;
     border-bottom: 1px solid var(--clodex-rp-border);
 }
 
 .clodex-rp-brand {
-    font-size: 14px;
+    font-size: 13.5px;
     letter-spacing: 0.02em;
     color: #fde68a;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .clodex-rp-head-actions {
     display: flex;
-    gap: 6px;
+    align-items: center;
+    gap: 5px;
+    flex-shrink: 0;
 }
 
 .clodex-rp-tabs {
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     gap: 4px;
-    padding: 8px 10px;
+    padding: 7px 8px;
     border-bottom: 1px solid var(--clodex-rp-border);
     background: rgba(0, 0, 0, 0.2);
 }
 
 .clodex-rp-tab-btn {
-    padding: 7px 6px;
+    padding: 7px 4px;
     border-radius: 9px;
     border: 1px solid transparent;
     background: transparent;
@@ -166,6 +177,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: center;
 }
 
 .clodex-rp-tab-btn.active {
@@ -206,23 +218,136 @@
         grid-template-columns: 1fr;
     }
     .clodex-rp-tabs {
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        padding: 6px;
+        gap: 3px;
+    }
+    .clodex-rp-tab-btn {
+        font-size: 11px;
+        padding: 6px 3px;
     }
 }
 
-.clodex-rp-forge-card {
+.clodex-rp-forge-card,
+.clodex-rp-comp-hero {
     display: flex;
     gap: 12px;
     align-items: flex-start;
 }
 
-.clodex-rp-forge-avatar {
+.clodex-rp-forge-avatar,
+.clodex-rp-comp-media {
     width: 96px;
-    height: 128px;
+    height: 124px;
     object-fit: cover;
     border-radius: 10px;
     border: 1px solid rgba(245, 158, 11, 0.45);
     flex-shrink: 0;
+    background: rgba(10, 13, 22, 0.7);
+}
+
+.clodex-rp-comp-placeholder {
+    width: 96px;
+    height: 124px;
+    border-radius: 10px;
+    border: 1px dashed rgba(245, 158, 11, 0.35);
+    background: radial-gradient(circle at 50% 35%, rgba(245, 158, 11, 0.16), rgba(139, 92, 246, 0.12));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 34px;
+    flex-shrink: 0;
+}
+
+.clodex-rp-stage-steps {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 4px;
+    margin-top: 6px;
+}
+
+.clodex-rp-stage-pill {
+    text-align: center;
+    font-size: 10.5px;
+    padding: 3px 4px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--clodex-rp-muted);
+    border: 1px solid transparent;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.clodex-rp-stage-pill.active {
+    background: rgba(236, 72, 153, 0.2);
+    border-color: rgba(244, 114, 182, 0.48);
+    color: #fbcfe8;
+    font-weight: 600;
+}
+
+.clodex-rp-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.clodex-rp-stat-item {
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 9px;
+    padding: 7px 9px;
+}
+
+.clodex-rp-stat-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11.5px;
+    margin-bottom: 5px;
+}
+
+.clodex-rp-stat-bar {
+    width: 100%;
+    height: 7px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+    overflow: hidden;
+}
+
+.clodex-rp-stat-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #f59e0b, #ec4899);
+    transition: width 0.25s ease;
+}
+
+.clodex-rp-stat-fill.is-fullness {
+    background: linear-gradient(90deg, #10b981, #34d399);
+}
+
+.clodex-rp-stat-fill.is-mood {
+    background: linear-gradient(90deg, #f59e0b, #fbbf24);
+}
+
+.clodex-rp-stat-fill.is-bond {
+    background: linear-gradient(90deg, #ec4899, #a855f7);
+}
+
+.clodex-rp-stat-fill.is-energy {
+    background: linear-gradient(90deg, #3b82f6, #38bdf8);
+}
+
+.clodex-rp-speech-bubble {
+    margin-top: 8px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    background: rgba(236, 72, 153, 0.12);
+    border: 1px solid rgba(244, 114, 182, 0.3);
+    color: #fdf2f8;
+    font-size: 12px;
+    line-height: 1.4;
 }
 
 .clodex-rp-audio {
@@ -276,9 +401,23 @@
     font-weight: 600;
 }
 
+.clodex-rp-btn-dynasty {
+    background: linear-gradient(135deg, rgba(236, 72, 153, 0.28), rgba(245, 158, 11, 0.28));
+    border-color: rgba(244, 114, 182, 0.5);
+    color: #fdf2f8;
+    font-weight: 600;
+}
+
 .clodex-rp-btn-mini {
     padding: 4px 8px;
     font-size: 11px;
+}
+
+.clodex-rp-btn-mini.active,
+.clodex-rp-chip-btn.active {
+    background: rgba(245, 158, 11, 0.22);
+    border-color: rgba(245, 158, 11, 0.55);
+    color: #fde68a;
 }
 
 .clodex-rp-chips {

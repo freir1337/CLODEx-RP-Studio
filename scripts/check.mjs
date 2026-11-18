@@ -99,6 +99,14 @@ assert.equal(tavoManifest.localization.defaultLocale, 'en');
 const tavoEn = JSON.parse(await readFile(resolve(root, 'tavo/locales/en.json'), 'utf8'));
 const tavoRu = JSON.parse(await readFile(resolve(root, 'tavo/locales/ru.json'), 'utf8'));
 assert.deepEqual(Object.keys(tavoEn).sort(), Object.keys(tavoRu).sort(), 'Tavo EN/RU locale keys must match');
+for (const key of literalKeys) {
+    assert.ok(tavoEn[key], `Missing Tavo EN translation for runtime key: ${key}`);
+    assert.ok(tavoRu[key], `Missing Tavo RU translation for runtime key: ${key}`);
+}
+assert.ok(
+    (tavoManifest.contributes.sidebar ?? []).some(item => item.id === 'open-cradle'),
+    'Tavo manifest must declare open-cradle sidebar action',
+);
 
 for (const [lang, catalog] of [['en', tavoEn], ['ru', tavoRu]]) {
     const resolveRef = val => (val && typeof val === 'object' && '$t' in val ? catalog[val.$t] : val);
@@ -151,5 +159,6 @@ assert.ok(tpgEntries.every(e => !e.includes('\\') && !e.startsWith('/') && !e.in
 const zipBuf = await readFile(resolve(root, 'dist', `CLODEx-RP-Studio-SillyTavern-${pkg.version}.zip`));
 const zipEntries = readZipEntries(zipBuf);
 assert.ok(zipEntries.includes('CLODEx-RP-Studio/manifest.json'), 'ST zip must include CLODEx-RP-Studio/manifest.json');
+assert.ok(zipEntries.includes('CLODEx-RP-Studio/src/core/companion.js'), 'ST zip must include CLODEx-RP-Studio/src/core/companion.js');
 
 console.log(`Audit OK: ${jsFiles.length} JS files, ${Object.keys(tavoEn).length} RU/EN keys, Tavo Manifest v2 (.tpg) & SillyTavern (.zip) verified.`);

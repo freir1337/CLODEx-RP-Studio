@@ -2,12 +2,12 @@
   "specVersion": 2,
   "id": "xyz.clodex.rp-studio",
   "name": { "$t": "plugin.name" },
-  "version": "1.1.0",
+  "version": "1.2.0",
   "minAppVersion": "0.93.0",
   "entry": "entry.js",
   "author": "CLODEx",
   "description": { "$t": "plugin.description" },
-  "releaseNotes": { "$t": "releaseNotes.1_1_0" },
+  "releaseNotes": { "$t": "releaseNotes.1_2_0" },
   "localization": {
     "defaultLocale": "en",
     "resources": {
@@ -41,6 +41,10 @@
       {
         "id": "open-studio",
         "label": { "$t": "actions.toggleStudio" }
+      },
+      {
+        "id": "open-cradle",
+        "label": { "$t": "actions.openCradle" }
       },
       {
         "id": "open-forge",

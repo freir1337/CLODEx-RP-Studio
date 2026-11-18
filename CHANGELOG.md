@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.2.0 — 2026-11-18
+
+- **Cradle & Familiar («Колыбель и Фамильяр») — Multimodal RP Companion & Dynasty System**:
+  - **Turn-1 SFW Familiars & 1-Click Family Tree Adoption**: summon an SFW companion right from Turn 1 (*Spirit Fox*, *Shadow Raven*, *Dragon Whelp*, *Homunculus*, *Celestial Wisp*) or transfer any baby/hatchling from `Family Tree & Offspring` in one click with inherited personality traits derived from your active story meters (`obsession`, `sanity`, `trust`, `mana`, etc.) and biology mode.
+  - **Tag-Free Growth & Zero-Punishment Care**: 4 life stages (`infant` → `child` → `teen` → `adult`), live HUD pill chip (`🐣 Name · Stage · 💛Mood%`), 4 care meters (*Fullness*, *Mood*, *Bond*, *Energy*) with offline Zero-Punishment floor (`>= 20`), and 5 tactile care actions (*Feed*, *Pet*, *Train*, *Play*, *Rest*) that arm natural RP hints for the next AI turn and roll back cleanly on message swipe/delete.
+  - **Multimodal Embodiment via CLODEx**: generate stage-evolved portraits via **Nano Banana** (`/v1/images/generations`), animate 4-second loops via **Image-to-Video** (`/v1/videos`), and synthesize stage-aware voice reactions (*infant babble/purrs → child/teen/adult speech*) via `/v1/chat/completions` + `/v1/audio/speech` with personal `voiceId`.
+  - **2nd-Generation Dynasty Graduation**: 1-click graduation exports a grown child or familiar into the **CCv2 Character & Lorebook Forge** to mint a standalone playable PNG Character Card V2 with a 5-entry childhood & lineage Lorebook.
+- **Mobile 1-Row Tab Discipline & Chat-Scoped Media Isolation**:
+  - Streamlined primary navigation into a crisp single-row 4-tab bar (`🧬 Tracker` | `🐣 Cradle` | `📜 Codex` | `🍌 Scene`) even on 390px mobile viewports, moving `⚒️ Forge` and `🔑 Key & Models` to compact header quick-buttons; isolated Tavo virtual media files with `scope: 'chat'` and added `message:updated` regeneration checkpoint rollback.
+- **Per-Character Voice Binding & FinOps Auto-Spend Shield**:
+  - Selecting or entering a voice in *Scene & Voice* now persists both `defaultVoice` and per-character `voiceMap[charName]`.
+  - Added `maxAutoSpendUsd` (default `$0.25`) session budget guard in *Key & Models* that tracks automatic background spend (`autoSpeak` / `autoImageEvery`) and pauses auto-calls with a clear notice before exceeding your cap, plus clearer quote-based pricing display in model selectors.
+
 ## 1.1.0 — 2026-11-18
 
 - **Character Voice (CLODEx TTS) for Tavo AI & SillyTavern**: `/v1/audio/voices` catalog loader, per-character voice binding, one-tap `Speak Character Reply` action in Tavo's message bar, and a smart *Dialogue-Only* filter that strips `*asterisk actions*` so only spoken lines are synthesized.

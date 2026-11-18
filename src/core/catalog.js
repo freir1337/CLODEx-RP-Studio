@@ -80,7 +80,42 @@ export function pickRecommendedModels(catalog, current = {}) {
 
 export function priceView(price) {
     if (!price) return null;
-    if (['expression', 'quote_based'].includes(price.billing_mode) || price.billing_expr) return { unit: 'dynamic' };
+    const isDynamicMode = ['expression', 'quote_based'].includes(price.billing_mode) || Boolean(price.billing_expr);
+    if (isDynamicMode) {
+        const groups = Array.isArray(price.enable_groups) ? price.enable_groups : [];
+        const ratios = price.group_ratio && typeof price.group_ratio === 'object' ? price.group_ratio : null;
+        const primaryGroup = ratios
+            ? groups.find(g => Object.prototype.hasOwnProperty.call(ratios, g) && finite(ratios[g]) && ratios[g] > 0)
+            : undefined;
+        const groupRatio = primaryGroup !== undefined ? ratios[primaryGroup] : 1;
+
+        if (finite(price.quote_base_credits) && price.quote_base_credits > 0) {
+            const perThousandUsd = finite(price.model_price) && price.model_price > 0 ? price.model_price : 0.5;
+            const est = Number(((price.quote_base_credits / 1000) * perThousandUsd * groupRatio).toFixed(6));
+            if (est > 0) return { unit: 'request', input: est };
+        }
+        if (finite(price.model_price) && price.model_price > 0) {
+            const est = Number((price.model_price * groupRatio).toFixed(6));
+            if (est > 0) return { unit: 'request', input: est };
+        }
+        if (finite(price.usage_fixed_price) && price.usage_fixed_price > 0) {
+            return {
+                unit: price.usage_fixed_price_unit || 'per_1m_total_tokens',
+                input: price.usage_fixed_price,
+                cached: finite(price.cached_usage_fixed_price) ? price.cached_usage_fixed_price : null,
+            };
+        }
+        if (price.quota_type === 0 && finite(price.model_ratio) && price.model_ratio > 0) {
+            const input = Number((price.model_ratio * 2 * groupRatio).toFixed(6));
+            return {
+                unit: 'per_1m_tokens',
+                input,
+                output: finite(price.completion_ratio) ? Number((input * price.completion_ratio).toFixed(6)) : null,
+                cached: finite(price.cache_ratio) ? Number((input * price.cache_ratio).toFixed(6)) : null,
+            };
+        }
+        return { unit: 'dynamic' };
+    }
     if (finite(price.usage_fixed_price)) {
         return {
             unit: price.usage_fixed_price_unit || 'per_1m_total_tokens',

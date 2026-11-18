@@ -1,3 +1,4 @@
+import { advanceCompanionsDays, normalizeCompanion } from './companion.js';
 import { addDaysToIso, diffDaysForward, parseIsoDate, TIME_SLOTS } from './date.js';
 
 export const BIO_MODES = Object.freeze(['none', 'cycle', 'omegaverse', 'oviposition']);
@@ -150,6 +151,7 @@ export function createChatState(initialDate = '2026-09-01') {
             char: createEntityState('char'),
         },
         offspring: [],    // [{ id, name, parentRole, originMode, gender, bornDate, notes }]
+        companions: [],   // up to 6 active companions/heirs normalized via normalizeCompanion
         customMeters: [], // [{ id, label, icon, min, max, value, showInHud }]
         inventory: {
             char: [],     // ['Silver Crucifix', ...]
@@ -265,6 +267,21 @@ export function normalizeChatState(raw) {
             bornDate: String(child.bornDate || out.world.rpDate),
             notes: String(child.notes ?? '').slice(0, 140),
         }));
+    }
+    if (Array.isArray(raw.companions)) {
+        const seenIds = new Set();
+        const seenChildIds = new Set();
+        out.companions = [];
+        for (const item of raw.companions) {
+            if (!item || typeof item !== 'object') continue;
+            const comp = normalizeCompanion(item, out.companions.length);
+            if (seenIds.has(comp.id)) continue;
+            if (comp.originChildId && seenChildIds.has(comp.originChildId)) continue;
+            seenIds.add(comp.id);
+            if (comp.originChildId) seenChildIds.add(comp.originChildId);
+            out.companions.push(comp);
+            if (out.companions.length >= 6) break;
+        }
     }
     if (raw.scene && typeof raw.scene === 'object') {
         out.scene.imagePath = String(raw.scene.imagePath ?? '').slice(0, 500);
@@ -600,6 +617,9 @@ export function advanceSimulationDays(state, deltaDays, { rng = defaultRng } = {
             }
         }
     }
+    if (Array.isArray(state.companions) && state.companions.length > 0) {
+        advanceCompanionsDays(state.companions, days);
+    }
     logEvent(state, `+${days}d → ${state.world.rpDate}`);
     return state;
 }
@@ -747,6 +767,46 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
         if (Array.isArray(removed) && removed.length) {
             const lowerRem = new Set(removed.map(x => String(x ?? '').trim().toLowerCase()));
             state.inventory[role] = state.inventory[role].filter(x => !lowerRem.has(x.toLowerCase()));
+        }
+    }
+
+    // Companion mood reaction to explicit delta or scene combat / stress atmosphere
+    if (Array.isArray(state.companions) && state.companions.length > 0) {
+        const hasExplicitMood = delta.companionMoodDelta !== undefined
+            && delta.companionMoodDelta !== null
+            && delta.companionMoodDelta !== ''
+            && Number.isFinite(Number(delta.companionMoodDelta));
+
+        if (hasExplicitMood) {
+            const moodShift = Math.round(clamp(Number(delta.companionMoodDelta), -15, 15));
+            if (moodShift !== 0) {
+                for (const comp of state.companions) {
+                    comp.mood = Math.round(clamp((Number(comp.mood) || 0) + moodShift, 0, 100));
+                }
+            }
+        } else {
+            const freshTrauma = ['user', 'char'].some(r => {
+                const ed = delta.entities?.[r];
+                return ed && (Boolean(ed.newWound) || Number(ed.bloodLossDelta) > 0);
+            });
+            const highStress = ['user', 'char'].some(r => {
+                const ed = delta.entities?.[r];
+                return Number(ed?.stressDelta) >= 15
+                    || (state.entities?.[r]?.enabled && state.entities[r].vitals.stress >= 75);
+            });
+            const soothingTurn = ['user', 'char'].some(r => {
+                const ed = delta.entities?.[r];
+                return ed && (Boolean(ed.treatedWounds) || Number(ed.stressDelta) <= -15);
+            });
+            const ambientShift = freshTrauma ? -10 : highStress ? -6 : soothingTurn ? 5 : 0;
+            if (ambientShift !== 0) {
+                for (const comp of state.companions) {
+                    const curMood = Number.isFinite(Number(comp.mood)) ? Number(comp.mood) : 85;
+                    comp.mood = ambientShift < 0
+                        ? Math.max(20, Math.round(curMood + ambientShift))
+                        : Math.min(100, Math.round(curMood + ambientShift));
+                }
+            }
         }
     }
 

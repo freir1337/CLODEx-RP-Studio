@@ -105,6 +105,18 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
         }
     }
 
+    if (Array.isArray(state.companions) && state.companions.length > 0) {
+        const compact = state.companions.length <= 2;
+        const compItems = state.companions.slice(0, 4).map(c => {
+            const moodNum = Math.round(Number(c.mood) || 0);
+            const fullNum = Math.round(Number(c.fullness) || 0);
+            const moodWord = compact ? (moodNum >= 75 ? 'cheerful ' : moodNum >= 45 ? 'calm ' : 'restless ') : '';
+            return `${String(c.name || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullNum}%)`;
+        });
+        const moreSuffix = state.companions.length > 4 ? ` (+${state.companions.length - 4} more)` : '';
+        lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
+    }
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -121,6 +133,9 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
     const meterSchemaHint = Array.isArray(state.customMeters) && state.customMeters.length > 0
         ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
         : '';
+    const companionSchemaHint = Array.isArray(state.companions) && state.companions.length > 0
+        ? `  "companionMoodDelta": 0, // integer -15..15 reflecting how this exchange affected companion(s): ${state.companions.slice(0, 4).map(c => c.name).join(', ')}`
+        : '';
 
     const systemPrompt = [
         'You are a strict JSON state-delta extractor for a roleplay simulation engine.',
@@ -134,6 +149,7 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
         '  "location": "short current location or empty string",',
         '  "weather": "short weather/atmosphere or empty string",',
         meterSchemaHint ? `  "customMeters": { ${meterSchemaHint} },` : '  "customMeters": {},',
+        companionSchemaHint,
         '  "inventoryAdd": { "user": [], "char": [] }, // short item names newly acquired/equipped this turn',
         '  "inventoryRemove": { "user": [], "char": [] }, // items lost/consumed/dropped this turn',
         '  "entities": {',
@@ -164,7 +180,7 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
         '    "char": { /* same fields as user */ }',
         '  }',
         '}',
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
     return [
         { role: 'system', content: systemPrompt },

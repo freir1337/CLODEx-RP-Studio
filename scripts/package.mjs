@@ -2,7 +2,7 @@
 // 1) Syncs SillyTavern (i18n/*.json) and Tavo v2 (tavo/locales/*.json) catalogs from src/core/localesData.js
 // 2) Generates crisp PNG icon & cover assets for Tavo
 // 3) Bundles classic IIFE scripts for Tavo (entry.js & ui/hud.js) where ESM is unsupported
-// 4) Emits dist/CLODEx-RP-Studio-1.0.0.tpg and dist/CLODEx-RP-Studio-SillyTavern-1.0.0.zip
+// 4) Emits dist/CLODEx-RP-Studio-1.2.0.tpg and dist/CLODEx-RP-Studio-SillyTavern-1.2.0.zip
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -183,6 +183,7 @@ await writeWithDir(resolve(root, 'tavo/cover.png'), generateBadgePng(256, 256, [
 const tavoEntryJs = await bundleClassicIife([
     'src/core/date.js',
     'src/core/physiology.js',
+    'src/core/companion.js',
     'src/core/prompts.js',
     'src/tavo/entry.src.js',
 ]);
@@ -191,6 +192,7 @@ const tavoHudJs = await bundleClassicIife([
     'src/core/catalog.js',
     'src/core/date.js',
     'src/core/physiology.js',
+    'src/core/companion.js',
     'src/core/prompts.js',
     'src/core/codex.js',
     'src/core/voice.js',
@@ -246,6 +248,7 @@ const stFiles = [
     'src/core/api.js',
     'src/core/catalog.js',
     'src/core/codex.js',
+    'src/core/companion.js',
     'src/core/date.js',
     'src/core/forge.js',
     'src/core/hud.js',

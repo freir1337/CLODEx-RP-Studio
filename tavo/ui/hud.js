@@ -391,7 +391,42 @@ function pickRecommendedModels(catalog, current = {}) {
 }
 function priceView(price) {
     if (!price) return null;
-    if (['expression', 'quote_based'].includes(price.billing_mode) || price.billing_expr) return { unit: 'dynamic' };
+    const isDynamicMode = ['expression', 'quote_based'].includes(price.billing_mode) || Boolean(price.billing_expr);
+    if (isDynamicMode) {
+        const groups = Array.isArray(price.enable_groups) ? price.enable_groups : [];
+        const ratios = price.group_ratio && typeof price.group_ratio === 'object' ? price.group_ratio : null;
+        const primaryGroup = ratios
+            ? groups.find(g => Object.prototype.hasOwnProperty.call(ratios, g) && finite(ratios[g]) && ratios[g] > 0)
+            : undefined;
+        const groupRatio = primaryGroup !== undefined ? ratios[primaryGroup] : 1;
+
+        if (finite(price.quote_base_credits) && price.quote_base_credits > 0) {
+            const perThousandUsd = finite(price.model_price) && price.model_price > 0 ? price.model_price : 0.5;
+            const est = Number(((price.quote_base_credits / 1000) * perThousandUsd * groupRatio).toFixed(6));
+            if (est > 0) return { unit: 'request', input: est };
+        }
+        if (finite(price.model_price) && price.model_price > 0) {
+            const est = Number((price.model_price * groupRatio).toFixed(6));
+            if (est > 0) return { unit: 'request', input: est };
+        }
+        if (finite(price.usage_fixed_price) && price.usage_fixed_price > 0) {
+            return {
+                unit: price.usage_fixed_price_unit || 'per_1m_total_tokens',
+                input: price.usage_fixed_price,
+                cached: finite(price.cached_usage_fixed_price) ? price.cached_usage_fixed_price : null,
+            };
+        }
+        if (price.quota_type === 0 && finite(price.model_ratio) && price.model_ratio > 0) {
+            const input = Number((price.model_ratio * 2 * groupRatio).toFixed(6));
+            return {
+                unit: 'per_1m_tokens',
+                input,
+                output: finite(price.completion_ratio) ? Number((input * price.completion_ratio).toFixed(6)) : null,
+                cached: finite(price.cache_ratio) ? Number((input * price.cache_ratio).toFixed(6)) : null,
+            };
+        }
+        return { unit: 'dynamic' };
+    }
     if (finite(price.usage_fixed_price)) {
         return {
             unit: price.usage_fixed_price_unit || 'per_1m_total_tokens',
@@ -648,6 +683,7 @@ function createChatState(initialDate = '2026-09-01') {
             char: createEntityState('char'),
         },
         offspring: [],    // [{ id, name, parentRole, originMode, gender, bornDate, notes }]
+        companions: [],   // up to 6 active companions/heirs normalized via normalizeCompanion
         customMeters: [], // [{ id, label, icon, min, max, value, showInHud }]
         inventory: {
             char: [],     // ['Silver Crucifix', ...]
@@ -762,6 +798,21 @@ function normalizeChatState(raw) {
             bornDate: String(child.bornDate || out.world.rpDate),
             notes: String(child.notes ?? '').slice(0, 140),
         }));
+    }
+    if (Array.isArray(raw.companions)) {
+        const seenIds = new Set();
+        const seenChildIds = new Set();
+        out.companions = [];
+        for (const item of raw.companions) {
+            if (!item || typeof item !== 'object') continue;
+            const comp = normalizeCompanion(item, out.companions.length);
+            if (seenIds.has(comp.id)) continue;
+            if (comp.originChildId && seenChildIds.has(comp.originChildId)) continue;
+            seenIds.add(comp.id);
+            if (comp.originChildId) seenChildIds.add(comp.originChildId);
+            out.companions.push(comp);
+            if (out.companions.length >= 6) break;
+        }
     }
     if (raw.scene && typeof raw.scene === 'object') {
         out.scene.imagePath = String(raw.scene.imagePath ?? '').slice(0, 500);
@@ -1089,6 +1140,9 @@ function advanceSimulationDays(state, deltaDays, { rng = defaultRng } = {}) {
             }
         }
     }
+    if (Array.isArray(state.companions) && state.companions.length > 0) {
+        advanceCompanionsDays(state.companions, days);
+    }
     logEvent(state, `+${days}d → ${state.world.rpDate}`);
     return state;
 }
@@ -1236,6 +1290,46 @@ function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRn
         }
     }
 
+    // Companion mood reaction to explicit delta or scene combat / stress atmosphere
+    if (Array.isArray(state.companions) && state.companions.length > 0) {
+        const hasExplicitMood = delta.companionMoodDelta !== undefined
+            && delta.companionMoodDelta !== null
+            && delta.companionMoodDelta !== ''
+            && Number.isFinite(Number(delta.companionMoodDelta));
+
+        if (hasExplicitMood) {
+            const moodShift = Math.round(clamp(Number(delta.companionMoodDelta), -15, 15));
+            if (moodShift !== 0) {
+                for (const comp of state.companions) {
+                    comp.mood = Math.round(clamp((Number(comp.mood) || 0) + moodShift, 0, 100));
+                }
+            }
+        } else {
+            const freshTrauma = ['user', 'char'].some(r => {
+                const ed = delta.entities?.[r];
+                return ed && (Boolean(ed.newWound) || Number(ed.bloodLossDelta) > 0);
+            });
+            const highStress = ['user', 'char'].some(r => {
+                const ed = delta.entities?.[r];
+                return Number(ed?.stressDelta) >= 15
+                    || (state.entities?.[r]?.enabled && state.entities[r].vitals.stress >= 75);
+            });
+            const soothingTurn = ['user', 'char'].some(r => {
+                const ed = delta.entities?.[r];
+                return ed && (Boolean(ed.treatedWounds) || Number(ed.stressDelta) <= -15);
+            });
+            const ambientShift = freshTrauma ? -10 : highStress ? -6 : soothingTurn ? 5 : 0;
+            if (ambientShift !== 0) {
+                for (const comp of state.companions) {
+                    const curMood = Number.isFinite(Number(comp.mood)) ? Number(comp.mood) : 85;
+                    comp.mood = ambientShift < 0
+                        ? Math.max(20, Math.round(curMood + ambientShift))
+                        : Math.min(100, Math.round(curMood + ambientShift));
+                }
+            }
+        }
+    }
+
     if (checkpointKey) saveCheckpoint(state, checkpointKey);
     return state;
 }
@@ -1271,6 +1365,622 @@ function activeEntitiesForTarget(targetMode) {
 function logEvent(state, summary) {
     state.activityLog.push({ atDate: state.world.rpDate, summary });
     if (state.activityLog.length > 40) state.activityLog = state.activityLog.slice(-40);
+}
+
+// --- src/core/companion.js ---
+const COMPANION_STAGES = Object.freeze(['infant', 'child', 'teen', 'adult']);
+const COMPANION_ARCHETYPES = Object.freeze([
+    'familiar_fox',
+    'shadow_raven',
+    'dragon_whelp',
+    'homunculus',
+    'celestial_wisp',
+]);
+
+const COMP_ARCHETYPE_PROFILES = Object.freeze({
+    familiar_fox: {
+        speciesKey: 'spirit_fox',
+        gender: 'female',
+        defaultName: { ru: 'Искорка', en: 'Emberkit' },
+        traits: {
+            ru: ['игривый нрав', 'чуткость к эмоциям'],
+            en: ['playful spirit', 'emotion-attuned'],
+        },
+        visualSubject: 'mystical spirit-fox familiar with warm russet-and-gold fur, luminous amber eyes, and ember-tipped tail',
+        motionCue: 'ears twitching softly as warm golden ember motes drift around its fluffy tail',
+    },
+    shadow_raven: {
+        speciesKey: 'shadow_raven',
+        gender: 'male',
+        defaultName: { ru: 'Ноктюрн', en: 'Nocturne' },
+        traits: {
+            ru: ['зоркий наблюдатель', 'хранитель тайн'],
+            en: ['keen observer', 'keeper of secrets'],
+        },
+        visualSubject: 'arcane shadow-raven familiar with iridescent obsidian plumage, silver-ringed eyes, and faint shadowy wisps',
+        motionCue: 'iridescent dark feathers ruffling gently with a clever head tilt and subtle silver eye glint',
+    },
+    dragon_whelp: {
+        speciesKey: 'dragon_whelp',
+        gender: 'male',
+        defaultName: { ru: 'Игнис', en: 'Ignis' },
+        traits: {
+            ru: ['гордый нрав', 'пылкое сердце'],
+            en: ['proud bearing', 'ember-hearted'],
+        },
+        visualSubject: 'miniature obsidian-and-crimson dragon whelp with warm glowing scale seams, curved horns, and golden slit eyes',
+        motionCue: 'leathery wings folding softly while a warm curl of golden ember smoke rises from its nostrils',
+    },
+    homunculus: {
+        speciesKey: 'homunculus',
+        gender: 'female',
+        defaultName: { ru: 'Аурелия', en: 'Aurelia' },
+        traits: {
+            ru: ['пытливый ум', 'алхимическая память'],
+            en: ['inquisitive mind', 'alchemical memory'],
+        },
+        visualSubject: 'delicate alchemical homunculus spirit with luminous porcelain features, expressive violet eyes, and subtle golden filigree runes',
+        motionCue: 'faint golden alchemical runes pulsing softly along its collar as it blinks with quiet curiosity',
+    },
+    celestial_wisp: {
+        speciesKey: 'celestial_wisp',
+        gender: 'neutral',
+        defaultName: { ru: 'Люмен', en: 'Lumen' },
+        traits: {
+            ru: ['умиротворяющий свет', 'эхо зари'],
+            en: ['soothing aura', 'dawn-lit resonance'],
+        },
+        visualSubject: 'ethereal celestial starlight wisp sprite with gossamer halo wings, warm pearl-gold core, and stardust trails',
+        motionCue: 'floating weightlessly in a gentle figure-eight while soft stardust sparkles shimmer around its halo',
+    },
+    offspring: {
+        speciesKey: 'dynasty_heir',
+        gender: 'female',
+        defaultName: { ru: 'Мира', en: 'Mira' },
+        traits: {
+            ru: ['черты родителей', 'живой нрав'],
+            en: ['parents\' likeness', 'lively spirit'],
+        },
+        visualSubject: 'cherished second-generation fantasy roleplay heir with expressive eyes and unmistakable familial resemblance',
+        motionCue: 'breathing calmly with a natural blink, warm micro-expression, and gentle hair movement in soft air',
+    },
+});
+
+const COMP_STAGE_VISUALS = Object.freeze({
+    infant: 'tiny newborn infant stage nestled in a cozy woven cradle blanket, delicate proportions, wide innocent eyes',
+    child: 'young child stage full of bright curiosity, playful posture, small stature, and expressive lively features',
+    teen: 'agile adolescent stage with emerging grace, confident posture, sharper features, and growing arcane presence',
+    adult: 'fully grown majestic adult stage with regal poise, refined silhouette, and mastered awakened presence',
+});
+
+const COMP_ACTION_SPECS = Object.freeze({
+    feed: {
+        fullness: 22,
+        mood: 6,
+        bond: 3,
+        energy: 5,
+        verb: 'warmly fed',
+        detail: 'eating happily and feeling cared for',
+    },
+    pet: {
+        fullness: 0,
+        mood: 14,
+        bond: 6,
+        energy: 2,
+        verb: 'gently petted and comforted',
+        detail: 'leaning into the affectionate touch with trust',
+    },
+    train: {
+        fullness: -6,
+        mood: 5,
+        bond: 8,
+        energy: -12,
+        verb: 'practiced a short training lesson with',
+        detail: 'showing eager focus and growing discipline',
+    },
+    play: {
+        fullness: -5,
+        mood: 16,
+        bond: 7,
+        energy: -10,
+        verb: 'played a lively game with',
+        detail: 'brightening the room with playful energy',
+    },
+    rest: {
+        fullness: -2,
+        mood: 8,
+        bond: 2,
+        energy: 28,
+        verb: 'tucked in to rest peacefully alongside',
+        detail: 'curling up into a calm, restorative nap nearby',
+    },
+});
+
+const COMP_TRAIT_EN_MAP = Object.freeze({
+    'игривый нрав': 'playful spirit',
+    'чуткость к эмоциям': 'emotion-attuned',
+    'зоркий наблюдатель': 'keen observer',
+    'хранитель тайн': 'keeper of secrets',
+    'гордый нрав': 'proud bearing',
+    'пылкое сердце': 'ember-hearted',
+    'пытливый ум': 'inquisitive mind',
+    'алхимическая память': 'alchemical memory',
+    'умиротворяющий свет': 'soothing dawn aura',
+    'эхо зари': 'starlit warmth',
+    'древняя чешуя и руны': 'subtle shimmering scales and faint rune marks',
+    'руническая чешуя': 'warm glowing runic scales',
+    'перламутровая чешуя': 'iridescent pearlescent scales',
+    'феромонная связь стаи': 'protective pack-bond instinct',
+    'черты родителей': 'inherited parental features',
+    'ревностная преданность': 'fierce devotion',
+    'печать бездны во взгляде': 'haunting otherworldly gaze',
+    'ясный рассудок': 'calm lucid composure',
+    'доверчивое сердце': 'warm trusting gaze',
+    'настороженный взгляд': 'guarded watchful eyes',
+    'печать запретного пламени': 'faint ember-crimson aura',
+    'врождённый дар маны': 'luminous arcane spark',
+    'острое чутьё': 'razor-sharp intuition',
+    'живой нрав': 'spirited curiosity',
+    'чуткость к опасности': 'protective vigilance',
+});
+
+function compClamp(val, min, max) {
+    return Math.min(max, Math.max(min, Number.isFinite(val) ? val : min));
+}
+
+function compFiniteOr(rawVal, fallback) {
+    if (rawVal === undefined || rawVal === null || rawVal === '') return fallback;
+    const n = Number(rawVal);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function compStageForAge(ageDays) {
+    const d = Math.max(0, Math.trunc(Number(ageDays) || 0));
+    if (d >= 45) return 'adult';
+    if (d >= 21) return 'teen';
+    if (d >= 7) return 'child';
+    return 'infant';
+}
+
+function compCleanMediaPath(value) {
+    const text = String(value ?? '').trim();
+    if (!text || /^data:/i.test(text) || text.length > 500) return '';
+    if (/[\x00-\x1f\x7f]/.test(text)) return '';
+    // Reject raw unprefixed base64 blobs accidentally passed as paths
+    if (text.length > 180 && !/[/.:]/.test(text)) return '';
+    return text;
+}
+
+function compMakeId(prefix = 'c') {
+    const rand = Math.random().toString(36).slice(2, 7);
+    const stamp = (Date.now() % 1_000_000).toString(36);
+    return `${prefix}-${stamp}${rand}`;
+}
+
+function compTraitToEnglish(trait) {
+    const clean = String(trait ?? '').trim();
+    if (!clean) return '';
+    const lower = clean.toLowerCase();
+    if (COMP_TRAIT_EN_MAP[lower]) return COMP_TRAIT_EN_MAP[lower];
+    // Keep ASCII traits as-is; map generic Cyrillic custom meter traits to clean English
+    if (/^[a-z0-9 _'&-]+$/i.test(clean)) return clean;
+    return 'distinctive inherited aura';
+}
+
+function compEnforceWordRange(baseText, minWords, maxWords, fillerPool) {
+    let words = String(baseText ?? '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .split(' ')
+        .filter(Boolean);
+
+    let fillerIdx = 0;
+    while (words.length < minWords && fillerIdx < fillerPool.length) {
+        const extra = fillerPool[fillerIdx].split(/\s+/).filter(Boolean);
+        words.push(...extra);
+        fillerIdx += 1;
+    }
+
+    if (words.length > maxWords) {
+        words = words.slice(0, maxWords);
+        const last = words[words.length - 1].replace(/[,:;]+$/, '');
+        words[words.length - 1] = /[.!?]$/.test(last) ? last : `${last}.`;
+    }
+    return words.join(' ');
+}
+function normalizeCompanion(raw, idx = 0) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const originChildId = String(src.originChildId ?? '').trim().slice(0, 64);
+    const archetype = COMPANION_ARCHETYPES.includes(src.archetype)
+        ? src.archetype
+        : (originChildId || src.archetype === 'offspring' ? 'offspring' : 'familiar_fox');
+    const profile = COMP_ARCHETYPE_PROFILES[archetype] || COMP_ARCHETYPE_PROFILES.familiar_fox;
+
+    const ageDays = Math.round(compClamp(Math.trunc(compFiniteOr(src.ageDays, 0)), 0, 36_500));
+    const stage = COMPANION_STAGES.includes(src.stage) ? src.stage : compStageForAge(ageDays);
+    const gender = ['female', 'male', 'neutral'].includes(src.gender) ? src.gender : profile.gender;
+    const rawId = String(src.id ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+    const portraitPath = compCleanMediaPath(src.portraitPath);
+    const videoPath = compCleanMediaPath(src.videoPath);
+
+    const rawTraits = Array.isArray(src.traits)
+        ? src.traits.map(item => String(item ?? '').trim().slice(0, 44)).filter(Boolean).slice(0, 4)
+        : [];
+
+    return {
+        id: rawId || `comp-${idx + 1}`,
+        name: String(src.name ?? '').trim().slice(0, 60) || profile.defaultName.en,
+        archetype,
+        speciesKey: String(src.speciesKey || profile.speciesKey).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || profile.speciesKey,
+        originChildId,
+        gender,
+        stage,
+        ageDays,
+        fullness: Math.round(compClamp(compFiniteOr(src.fullness, 85), 0, 100)),
+        mood: Math.round(compClamp(compFiniteOr(src.mood, 85), 0, 100)),
+        bond: Math.round(compClamp(compFiniteOr(src.bond, 35), 0, 100)),
+        energy: Math.round(compClamp(compFiniteOr(src.energy, 90), 0, 100)),
+        traits: rawTraits.length > 0 ? rawTraits : [...profile.traits.en],
+        voiceId: String(src.voiceId ?? '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 120),
+        portraitPath,
+        videoPath,
+        videoTaskId: String(src.videoTaskId ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 160),
+        needsStageArt: src.needsStageArt === undefined ? false : Boolean(src.needsStageArt),
+        lastActionAt: String(src.lastActionAt ?? '').trim().slice(0, 40),
+    };
+}
+function createCompanionFromArchetype(archetypeId, { customName = '', locale = 'ru' } = {}) {
+    const arch = COMPANION_ARCHETYPES.includes(archetypeId) ? archetypeId : 'familiar_fox';
+    const profile = COMP_ARCHETYPE_PROFILES[arch];
+    const lang = String(locale || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en';
+    const cleanName = String(customName ?? '').trim().slice(0, 60) || profile.defaultName[lang];
+
+    return normalizeCompanion({
+        id: compMakeId('fam'),
+        name: cleanName,
+        archetype: arch,
+        speciesKey: profile.speciesKey,
+        originChildId: '',
+        gender: profile.gender,
+        stage: 'infant',
+        ageDays: 0,
+        fullness: 85,
+        mood: 85,
+        bond: 35,
+        energy: 90,
+        traits: [...profile.traits[lang]],
+        voiceId: '',
+        portraitPath: '',
+        videoPath: '',
+        videoTaskId: '',
+        needsStageArt: true,
+        lastActionAt: '',
+    });
+}
+
+function compDeriveOffspringTraits(child, state, lang) {
+    const traits = [];
+    const originMode = String(child?.originMode || 'cycle');
+    const notes = String(child?.notes ?? '').toLowerCase();
+
+    let speciesKey = 'dynasty_heir';
+    if (originMode === 'oviposition') {
+        speciesKey = 'wyrm_hatchling';
+        if (notes.includes('warm_runic')) {
+            traits.push(lang === 'ru' ? 'руническая чешуя' : 'warm glowing runic scales');
+        } else if (notes.includes('pearl_smooth')) {
+            traits.push(lang === 'ru' ? 'перламутровая чешуя' : 'iridescent pearlescent scales');
+        } else {
+            traits.push(lang === 'ru' ? 'древняя чешуя и руны' : 'ancient scales & runes');
+        }
+    } else if (originMode === 'omegaverse') {
+        speciesKey = 'omega_heir';
+        traits.push(lang === 'ru' ? 'феромонная связь стаи' : 'pheromone pack bond');
+    } else {
+        speciesKey = 'dynasty_heir';
+        traits.push(lang === 'ru' ? 'черты родителей' : 'parents\' likeness');
+    }
+
+    const meters = Array.isArray(state?.customMeters) ? state.customMeters : [];
+    const candidates = [];
+
+    for (const m of meters) {
+        if (!m || typeof m !== 'object') continue;
+        const id = String(m.id || '').toLowerCase();
+        const min = Number.isFinite(Number(m.min)) ? Number(m.min) : 0;
+        const max = Number.isFinite(Number(m.max)) && Number(m.max) > min ? Number(m.max) : min + 100;
+        const val = compFiniteOr(m.value, min);
+        const ratio = (val - min) / (max - min);
+        const weight = Math.abs(ratio - 0.5);
+
+        if (id === 'obsession' && val >= 60) {
+            candidates.push({ weight: weight + 0.3, trait: lang === 'ru' ? 'ревностная преданность' : 'fierce devotion' });
+        } else if (id === 'sanity' && val <= 40) {
+            candidates.push({ weight: weight + 0.3, trait: lang === 'ru' ? 'печать бездны во взгляде' : 'haunting abyssal gaze' });
+        } else if (id === 'sanity' && val >= 75) {
+            candidates.push({ weight: weight + 0.15, trait: lang === 'ru' ? 'ясный рассудок' : 'calm lucid composure' });
+        } else if (id === 'trust' && (ratio >= 0.7 || val >= 40)) {
+            candidates.push({ weight: weight + 0.25, trait: lang === 'ru' ? 'доверчивое сердце' : 'warm trusting heart' });
+        } else if (id === 'trust' && (ratio <= 0.35 || val <= -25)) {
+            candidates.push({ weight: weight + 0.25, trait: lang === 'ru' ? 'настороженный взгляд' : 'guarded watchful eyes' });
+        } else if (id === 'sin' && val >= 60) {
+            candidates.push({ weight: weight + 0.2, trait: lang === 'ru' ? 'печать запретного пламени' : 'mark of forbidden flame' });
+        } else if (id === 'mana' && val >= 65) {
+            candidates.push({ weight: weight + 0.2, trait: lang === 'ru' ? 'врождённый дар маны' : 'innate arcane spark' });
+        } else if (id === 'suspicion' && val >= 60) {
+            candidates.push({ weight: weight + 0.2, trait: lang === 'ru' ? 'острое чутьё' : 'razor-sharp intuition' });
+        } else if (ratio >= 0.75 && m.label) {
+            const label = String(m.label).trim().slice(0, 24).toLowerCase();
+            candidates.push({ weight, trait: lang === 'ru' ? `дар: ${label}` : `blessed by ${label}` });
+        } else if (ratio <= 0.25 && m.label) {
+            const label = String(m.label).trim().slice(0, 24).toLowerCase();
+            candidates.push({ weight, trait: lang === 'ru' ? `тень: ${label}` : `marked by low ${label}` });
+        }
+    }
+
+    candidates.sort((a, b) => b.weight - a.weight);
+    for (const item of candidates) {
+        if (traits.length >= 3) break;
+        if (!traits.includes(item.trait)) traits.push(item.trait);
+    }
+
+    if (traits.length < 2) {
+        const parentRole = child?.parentRole === 'user' ? 'user' : 'char';
+        const stress = Number(state?.entities?.[parentRole]?.vitals?.stress ?? 0);
+        if (stress >= 65) {
+            traits.push(lang === 'ru' ? 'чуткость к опасности' : 'protective vigilance');
+        } else {
+            traits.push(lang === 'ru' ? 'живой нрав' : 'spirited curiosity');
+        }
+    }
+
+    return { speciesKey, traits: traits.slice(0, 3) };
+}
+function createCompanionFromOffspring(child, state, { locale = 'ru' } = {}) {
+    const srcChild = child && typeof child === 'object' ? child : {};
+    const childId = String(srcChild.id || compMakeId('child')).trim().slice(0, 64);
+    const lang = String(locale || 'ru').toLowerCase().startsWith('ru') ? 'ru' : 'en';
+
+    if (state && typeof state === 'object') {
+        if (!Array.isArray(state.companions)) state.companions = [];
+        const existing = state.companions.find(c => c && c.originChildId === childId);
+        if (existing) return existing;
+    }
+
+    const gender = srcChild.gender === 'male' ? 'male' : 'female';
+    const originMode = String(srcChild.originMode || 'cycle');
+    const fallbackNames = originMode === 'oviposition'
+        ? { ru: gender === 'male' ? 'Драко' : 'Астра', en: gender === 'male' ? 'Draco' : 'Astra' }
+        : originMode === 'omegaverse'
+            ? { ru: gender === 'male' ? 'Ренар' : 'Лира', en: gender === 'male' ? 'Renard' : 'Lyra' }
+            : { ru: gender === 'male' ? 'Тео' : 'Мира', en: gender === 'male' ? 'Theo' : 'Mira' };
+
+    const cleanName = String(srcChild.name ?? '').trim().slice(0, 60) || fallbackNames[lang];
+    const ageDays = srcChild.bornDate && state?.world?.rpDate
+        ? diffDaysForward(srcChild.bornDate, state.world.rpDate)
+        : 0;
+    const { speciesKey, traits } = compDeriveOffspringTraits(srcChild, state, lang);
+
+    const created = normalizeCompanion({
+        id: compMakeId('heir'),
+        name: cleanName,
+        archetype: 'offspring',
+        speciesKey,
+        originChildId: childId,
+        gender,
+        stage: compStageForAge(ageDays),
+        ageDays,
+        fullness: 85,
+        mood: 85,
+        bond: 50,
+        energy: 90,
+        traits,
+        voiceId: '',
+        portraitPath: '',
+        videoPath: '',
+        videoTaskId: '',
+        needsStageArt: true,
+        lastActionAt: String(state?.world?.rpDate ?? ''),
+    });
+
+    if (state && Array.isArray(state.companions) && state.companions.length < 6) {
+        state.companions.push(created);
+    }
+    return created;
+}
+function interactWithCompanion(companion, action, { rpDate = '' } = {}) {
+    const target = companion && typeof companion === 'object' ? companion : normalizeCompanion({});
+    const actKey = Object.prototype.hasOwnProperty.call(COMP_ACTION_SPECS, action) ? action : 'pet';
+    const spec = COMP_ACTION_SPECS[actKey];
+
+    target.fullness = Math.round(compClamp(compFiniteOr(target.fullness, 85) + spec.fullness, 0, 100));
+    target.mood = Math.round(compClamp(compFiniteOr(target.mood, 85) + spec.mood, 0, 100));
+    target.bond = Math.round(compClamp(compFiniteOr(target.bond, 35) + spec.bond, 0, 100));
+    target.energy = Math.round(compClamp(compFiniteOr(target.energy, 90) + spec.energy, 0, 100));
+    target.lastActionAt = String(rpDate ?? '').trim().slice(0, 40);
+
+    const stageLabel = COMPANION_STAGES.includes(target.stage) ? target.stage : 'infant';
+    const roleLabel = target.originChildId ? `${stageLabel} child` : `${stageLabel} companion`;
+    const memoryHint = `{{user}} ${spec.verb} ${target.name} (${roleLabel}); naturally weave a brief moment of ${target.name} ${spec.detail} into this turn.`;
+
+    return { companion: target, memoryHint };
+}
+function advanceCompanionsDays(companions, deltaDays) {
+    if (!Array.isArray(companions)) return [];
+    const days = Math.round(compClamp(Math.trunc(Number(deltaDays) || 0), 0, 36_500));
+    if (days <= 0) return companions;
+
+    for (const comp of companions) {
+        if (!comp || typeof comp !== 'object') continue;
+        const prevStage = COMPANION_STAGES.includes(comp.stage) ? comp.stage : compStageForAge(comp.ageDays);
+        comp.ageDays = Math.max(0, Math.trunc(compFiniteOr(comp.ageDays, 0))) + days;
+        const nextStage = compStageForAge(comp.ageDays);
+        comp.stage = nextStage;
+        if (nextStage !== prevStage) {
+            comp.needsStageArt = true;
+        }
+        // Zero Punishment rule: passive time progression never drops vital care meters below 20
+        comp.fullness = Math.round(compClamp(Math.max(20, compFiniteOr(comp.fullness, 85) - days * 6), 20, 100));
+        comp.energy = Math.round(compClamp(Math.max(20, compFiniteOr(comp.energy, 90) - days * 4), 20, 100));
+        comp.mood = Math.round(compClamp(Math.max(20, compFiniteOr(comp.mood, 85) - days * 3), 20, 100));
+        comp.bond = Math.round(compClamp(compFiniteOr(comp.bond, 35), 0, 100));
+    }
+    return companions;
+}
+function buildCompanionPortraitPrompt(companion, {
+    charName = '',
+    charDescription = '',
+    userName = '',
+    stylePreset = 'cinematic',
+} = {}) {
+    const comp = normalizeCompanion(companion);
+    const profile = COMP_ARCHETYPE_PROFILES[comp.archetype] || COMP_ARCHETYPE_PROFILES.familiar_fox;
+    const stageDesc = COMP_STAGE_VISUALS[comp.stage] || COMP_STAGE_VISUALS.infant;
+
+    const styleLead = stylePreset === 'dark_gothic'
+        ? 'Dark gothic chiaroscuro portrait illustration, warm candlelight, ornate sanctuary backdrop, rich oil-painted textures.'
+        : stylePreset === 'anime_illustration'
+            ? 'Masterpiece anime key visual character portrait, luminous cel-shaded lighting, expressive detailed eyes, rich painterly background.'
+            : 'Cinematic fantasy character portrait, atmospheric volumetric lighting, shallow depth of field, ultra-detailed digital painting.';
+
+    const moodDesc = comp.mood >= 75
+        ? 'radiant joyful expression, bright affectionate gaze, lively posture'
+        : comp.mood >= 45
+            ? 'calm attentive expression, gentle curious gaze, poised posture'
+            : 'wistful tender expression, soft eyes seeking warmth and reassurance';
+
+    const enTraits = comp.traits.map(compTraitToEnglish).filter(Boolean).join(', ') || 'loyal gentle spirit';
+
+    const parentClean = String(charDescription ?? '')
+        .replace(/[\r\n#*`<>[\]{}]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .split(' ')
+        .filter(Boolean)
+        .slice(0, 14)
+        .join(' ');
+
+    const lineageClause = comp.originChildId || comp.archetype === 'offspring'
+        ? `Subtle familial resemblance to ${charName || 'their parent'}${parentClean ? ` (${parentClean})` : ''}${userName ? ` and ${userName}` : ''}, echoing shared hair, eye, and aura motifs.`
+        : `Subtle magical bond motifs echoing ${charName || userName || 'their keeper'}${parentClean ? ` with hints inspired by ${parentClean}` : ''}, harmonious color palette.`;
+
+    const subjectDesc = comp.speciesKey === 'wyrm_hatchling'
+        ? 'enchanting dragon-blooded fantasy heir with delicate shimmering scales and warm luminous eyes'
+        : profile.visualSubject;
+
+    const rawPrompt = [
+        styleLead,
+        `Subject: ${comp.name}, a ${comp.gender !== 'neutral' ? `${comp.gender} ` : ''}${subjectDesc}, depicted at the ${stageDesc}.`,
+        `Personality and mood: ${moodDesc}, embodying traits of ${enTraits}.`,
+        lineageClause,
+        'Centered solo portrait framing, intricate surface detail, soft rim light, clean composition, no text overlays, no speech bubbles, no watermarks.',
+    ].join(' ');
+
+    return compEnforceWordRange(rawPrompt, 64, 104, [
+        'Warm atmospheric bokeh particles drift gently through the background air, highlighting crisp silhouettes and natural anatomy.',
+        'Rich color harmony and museum-grade fantasy concept art finish.',
+    ]);
+}
+function buildCompanionVideoPrompt(companion) {
+    const comp = normalizeCompanion(companion);
+    const profile = COMP_ARCHETYPE_PROFILES[comp.archetype] || COMP_ARCHETYPE_PROFILES.familiar_fox;
+    const moodMotion = comp.mood >= 75
+        ? 'happy lively demeanor and warm affectionate gaze toward the viewer'
+        : comp.mood >= 45
+            ? 'calm curious demeanor and gentle attentive breathing'
+            : 'soft sleepy demeanor settling cozily for warmth';
+
+    const rawPrompt = [
+        `Subtle 4-second cinematic image-to-video animation of ${comp.name} at the ${comp.stage} stage:`,
+        `${profile.motionCue}, natural eye blink, ${moodMotion}.`,
+        'Smooth micro-camera push-in, consistent character anatomy and lighting, drifting ambient dust motes, seamless loopable motion, no distortion or text.',
+    ].join(' ');
+
+    return compEnforceWordRange(rawPrompt, 34, 56, [
+        'Soft volumetric rim light flickers gently across fine textures in tranquil atmosphere.',
+    ]);
+}
+function buildCompanionBabbleMessages(companion, {
+    charName = '',
+    userName = '',
+    locale = 'ru',
+} = {}) {
+    const comp = normalizeCompanion(companion);
+    const isRu = String(locale || 'ru').toLowerCase().startsWith('ru');
+    const langName = isRu ? 'Russian' : 'English';
+    const quoteExample = isRu ? '«...»' : '"..."';
+
+    const stageVoiceRule = comp.stage === 'infant'
+        ? (isRu
+            ? 'Stage is INFANT: output melodic, pronounceable baby babble, cooing, or familiar purrs/chirps inside quotes (e.g. «Агу-у… мрр, теп-ло!»), 1 short sentence, NO adult vocabulary.'
+            : 'Stage is INFANT: output melodic, pronounceable baby coos, babble, or familiar chirps/purrs inside quotes (e.g. "Coo-ooh... mrr, warm!"), 1 short sentence, NO adult vocabulary.')
+        : comp.stage === 'child'
+            ? 'Stage is CHILD: output 1–2 short, lively, innocent childlike spoken sentences full of curiosity and warmth.'
+            : comp.stage === 'teen'
+                ? 'Stage is TEEN: output 1–2 expressive adolescent spoken sentences showing emerging personality, wit, and traits.'
+                : 'Stage is ADULT: output 1–2 poised, articulate, emotionally resonant spoken sentences reflecting maturity and loyalty.';
+
+    const needNote = comp.fullness <= 35
+        ? 'feeling noticeably hungry'
+        : comp.energy <= 35
+            ? 'feeling sleepy and ready to rest'
+            : comp.mood >= 80
+                ? 'feeling joyful and affectionate'
+                : 'feeling calm and attentive';
+
+    const systemContent = [
+        `You roleplay ONLY as ${comp.name} (${comp.originChildId ? 'child/heir' : comp.speciesKey.replace(/_/g, ' ')}, stage: ${comp.stage}).`,
+        `Write in ${langName}. Return ONLY 1–2 short spoken sentences enclosed in quotation marks (${quoteExample}) suitable for direct text-to-speech playback, with no narration outside quotes and no markdown.`,
+        stageVoiceRule,
+        `Traits: ${comp.traits.join(', ')}. Current state: ${needNote}, bond ${comp.bond}/100.`,
+    ].join(' ');
+
+    const caregivers = [charName, userName].filter(Boolean).join(' & ') || 'your caregiver';
+    const userContent = isRu
+        ? `Произнеси одну живую короткую реплику в кавычках от лица ${comp.name} для ${caregivers}.`
+        : `Speak one short, vivid in-character line in quotes as ${comp.name} addressing ${caregivers}.`;
+
+    return [
+        { role: 'system', content: systemContent },
+        { role: 'user', content: userContent },
+    ];
+}
+function buildCompanionForgeConcept(companion, {
+    charName = '',
+    userName = '',
+    locale = 'ru',
+} = {}) {
+    const comp = normalizeCompanion(companion);
+    const isRu = String(locale || 'ru').toLowerCase().startsWith('ru');
+    const parentA = charName || '{{char}}';
+    const parentB = userName || '{{user}}';
+    const traitsList = comp.traits.join(', ');
+    const isHeir = Boolean(comp.originChildId || comp.archetype === 'offspring');
+
+    if (isRu) {
+        const lineage = isHeir
+            ? `Повзрослевший наследник второго поколения (${comp.gender === 'male' ? 'сын' : 'дочь'} ${parentA} и ${parentB}, проживший ${comp.ageDays} дн. в хронике Колыбели)`
+            : `Пробудившийся в самостоятельном облике фамильяр-спутник (${comp.speciesKey.replace(/_/g, ' ')}, воспитанный ${parentA} и ${parentB} за ${comp.ageDays} дн. странствий, узы ${comp.bond}/100)`;
+        return [
+            `Имя персонажа: ${comp.name}.`,
+            `Происхождение и роль: ${lineage}.`,
+            `Унаследованные черты характера: ${traitsList}. Темперамент и настрой: ${comp.mood}/100.`,
+            `Сделай полноценную карточку второго поколения (CCv2): детальная внешность взрослой стадии, манера речи, личная цель и сложная эмоциональная связь с {{user}} и ${parentA}.`,
+            `Включи 5 записей лорбука: (1) детство в Колыбели и уроки ${parentA}, (2) родословная и унаследованные черты (${traitsList}), (3) особый дар или фамильная реликвия, (4) момент взросления и обретения собственного пути, (5) нынешнее отношение к {{user}}.`,
+        ].join(' ');
+    }
+
+    const lineageEn = isHeir
+        ? `Grown second-generation dynasty heir (${comp.gender === 'male' ? 'son' : 'daughter'} of ${parentA} and ${parentB}, raised across ${comp.ageDays} days in the Cradle chronicle)`
+        : `Awakened ascendant familiar (${comp.speciesKey.replace(/_/g, ' ')}, raised by ${parentA} and ${parentB} over ${comp.ageDays} days, bond ${comp.bond}/100)`;
+
+    return [
+        `Character Name: ${comp.name}.`,
+        `Origin & Role: ${lineageEn}.`,
+        `Inherited Personality Traits: ${traitsList}. Temperament & morale: ${comp.mood}/100.`,
+        `Design a rich second-generation CCv2 character card: adult appearance, distinct voice, personal ambition, and deep history with {{user}} and ${parentA}.`,
+        `Include 5 lorebook entries covering: (1) childhood memories in the Cradle with ${parentA}, (2) lineage and inherited traits (${traitsList}), (3) signature gift or family keepsake, (4) coming-of-age turning point, and (5) current dynamic with {{user}}.`,
+    ].join(' ');
 }
 
 // --- src/core/prompts.js ---
@@ -1379,6 +2089,18 @@ function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}
         }
     }
 
+    if (Array.isArray(state.companions) && state.companions.length > 0) {
+        const compact = state.companions.length <= 2;
+        const compItems = state.companions.slice(0, 4).map(c => {
+            const moodNum = Math.round(Number(c.mood) || 0);
+            const fullNum = Math.round(Number(c.fullness) || 0);
+            const moodWord = compact ? (moodNum >= 75 ? 'cheerful ' : moodNum >= 45 ? 'calm ' : 'restless ') : '';
+            return `${String(c.name || 'Companion').slice(0, 24)} (${c.stage || 'infant'}, mood ${moodWord}${moodNum}%, fullness ${fullNum}%)`;
+        });
+        const moreSuffix = state.companions.length > 4 ? ` (+${state.companions.length - 4} more)` : '';
+        lines.push(`• Active Companions: ${compItems.join('; ')}${moreSuffix}.`);
+    }
+
     if (state.world.pendingMemoryHint) {
         lines.push(`[Lore / Canon Guidance for This Turn]: ${state.world.pendingMemoryHint}`);
     }
@@ -1394,6 +2116,9 @@ function buildTrackerExtractionMessages(state, recentMessages, { userName = 'Use
     const meterSchemaHint = Array.isArray(state.customMeters) && state.customMeters.length > 0
         ? state.customMeters.map(m => `"${m.id}": ${m.value} /* ${m.label}, range ${m.min}..${m.max}, adjust if latest scene changed it */`).join(', ')
         : '';
+    const companionSchemaHint = Array.isArray(state.companions) && state.companions.length > 0
+        ? `  "companionMoodDelta": 0, // integer -15..15 reflecting how this exchange affected companion(s): ${state.companions.slice(0, 4).map(c => c.name).join(', ')}`
+        : '';
 
     const systemPrompt = [
         'You are a strict JSON state-delta extractor for a roleplay simulation engine.',
@@ -1407,6 +2132,7 @@ function buildTrackerExtractionMessages(state, recentMessages, { userName = 'Use
         '  "location": "short current location or empty string",',
         '  "weather": "short weather/atmosphere or empty string",',
         meterSchemaHint ? `  "customMeters": { ${meterSchemaHint} },` : '  "customMeters": {},',
+        companionSchemaHint,
         '  "inventoryAdd": { "user": [], "char": [] }, // short item names newly acquired/equipped this turn',
         '  "inventoryRemove": { "user": [], "char": [] }, // items lost/consumed/dropped this turn',
         '  "entities": {',
@@ -1437,7 +2163,7 @@ function buildTrackerExtractionMessages(state, recentMessages, { userName = 'Use
         '    "char": { /* same fields as user */ }',
         '  }',
         '}',
-    ].join('\n');
+    ].filter(Boolean).join('\n');
 
     return [
         { role: 'system', content: systemPrompt },
@@ -1961,12 +2687,21 @@ function createRpStudioController(bridge) {
     const win = doc.defaultView ?? globalThis;
     const t = (key, params) => bridge.t(key, params);
 
+    const ARCHETYPE_ICONS = {
+        familiar_fox: '🦊',
+        shadow_raven: '🪶',
+        dragon_whelp: '🐉',
+        homunculus: '🧪',
+        celestial_wisp: '✨',
+    };
+
     let drawerOpen = false;
     let activeTab = 'tracker';
     let activeEntityRole = 'char';
     let peekSpoilers = false;
     let busyState = '';
     let sceneStatusText = '';
+    let cradleStatusText = '';
     let errorBanner = '';
     let codexDraft = '';
     let codexPreset = 'lore_keeper';
@@ -1979,8 +2714,16 @@ function createRpStudioController(bridge) {
     let meterIconDraft = '🖤';
     let invItemDraft = '';
 
+    let activeCompanionId = '';
+    let companionNameDraft = '';
+    const companionAudioMap = new Map();
+    const companionReactionMap = new Map();
+    const companionObjectUrls = [];
+
     let voiceList = [];
     let activeAudioUrl = '';
+    let currentCharName = '';
+    let sessionAutoSpendUsd = 0;
 
     let forgeConcept = '';
     let forgeLang = bridge.getLocale() === 'ru' ? 'ru' : 'en';
@@ -2025,6 +2768,89 @@ function createRpStudioController(bridge) {
     drawerBackdrop.append(drawerPanel);
     hostRoot.append(backdropEl, hudPill, drawerBackdrop);
     bridge.mountContainer.append(hostRoot);
+
+    function syncCachedCharName() {
+        bridge.getRpContext?.().then(rp => {
+            if (rp?.charName && rp.charName !== currentCharName) {
+                currentCharName = rp.charName;
+                if (drawerOpen && activeTab === 'scene') renderDrawer();
+            }
+        }).catch(() => {});
+    }
+
+    function getActiveCompanion(state) {
+        const list = Array.isArray(state?.companions) ? state.companions : [];
+        if (!list.length) return null;
+        const found = list.find(c => c.id === activeCompanionId);
+        if (found) return found;
+        activeCompanionId = list[0].id;
+        return list[0];
+    }
+
+    async function saveCompanionAsset(companionId, kind, blob, base64) {
+        if (typeof bridge.saveCompanionMedia === 'function') {
+            const saved = await bridge.saveCompanionMedia({ companionId, kind, blob, base64 });
+            if (saved) return saved;
+        }
+        if (typeof URL?.createObjectURL === 'function' && blob) {
+            const objUrl = URL.createObjectURL(blob);
+            companionObjectUrls.push(objUrl);
+            return objUrl;
+        }
+        const mime = kind === 'video' ? 'video/mp4' : kind === 'audio' ? 'audio/mpeg' : 'image/png';
+        return base64 ? `data:${mime};base64,${base64}` : '';
+    }
+
+    function estimateAutoCallCostUsd(modelId, kind) {
+        const modelObj = catalog.find(m => m.id === modelId);
+        const pv = priceView(modelObj?.price);
+        if (pv && pv.unit === 'request' && typeof pv.input === 'number' && pv.input > 0) {
+            return pv.input;
+        }
+        return kind === 'image' ? 0.04 : 0.015;
+    }
+
+    function checkAutoSpendAllowed(modelId, kind) {
+        const settings = bridge.getSettings();
+        const rawCap = settings.maxAutoSpendUsd ?? 0.25;
+        const cap = Number.isFinite(Number(rawCap)) ? Math.max(0, Number(rawCap)) : 0.25;
+        const est = estimateAutoCallCostUsd(modelId, kind);
+        if (cap <= 0 || sessionAutoSpendUsd >= cap || sessionAutoSpendUsd + est > cap) {
+            const msg = t('notice.autoSpendCapReached', {
+                spent: formatUsd(sessionAutoSpendUsd),
+                cap: formatUsd(cap),
+            });
+            errorBanner = msg;
+            bridge.notify?.(msg);
+            renderAll();
+            return { allowed: false, est };
+        }
+        return { allowed: true, est };
+    }
+
+    async function recordAutoSpendAndRefresh(estCostUsd) {
+        const prevUsd = wallet?.usd ?? null;
+        await refreshAccount().catch(() => {});
+        const actualDelta = prevUsd !== null && wallet?.usd !== null && prevUsd > wallet.usd
+            ? prevUsd - wallet.usd
+            : 0;
+        const delta = actualDelta > 0 ? actualDelta : estCostUsd;
+        sessionAutoSpendUsd = Math.round((sessionAutoSpendUsd + delta) * 10000) / 10000;
+    }
+
+    async function saveCharacterVoiceSelection(rawVoice) {
+        const val = String(rawVoice ?? '').trim() || 'alloy';
+        const rp = await bridge.getRpContext?.().catch(() => null);
+        const charName = rp?.charName || currentCharName || '';
+        if (charName) currentCharName = charName;
+        const settings = bridge.getSettings();
+        const nextVoiceMap = { ...(settings.voiceMap || {}) };
+        if (charName) nextVoiceMap[charName] = val;
+        await bridge.updateSettings({
+            defaultVoice: val,
+            voiceMap: nextVoiceMap,
+        });
+    }
 
     // Draggable HUD Pill with mouse & touch support + viewport inset clamping
     let dragState = null;
@@ -2093,7 +2919,10 @@ function createRpStudioController(bridge) {
     function toggleDrawer(open) {
         drawerOpen = Boolean(open);
         drawerBackdrop.hidden = !drawerOpen;
-        if (drawerOpen) renderDrawer();
+        if (drawerOpen) {
+            if (activeTab === 'scene') syncCachedCharName();
+            renderDrawer();
+        }
     }
 
     function formatUsd(val) {
@@ -2188,6 +3017,16 @@ function createRpStudioController(bridge) {
             chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, bioLabel));
         }
 
+        const activeComp = getActiveCompanion(state);
+        if (activeComp) {
+            const safeStage = COMPANION_STAGES.includes(activeComp.stage) ? activeComp.stage : 'infant';
+            const stageLabel = t(`cradle.stage.${safeStage}`);
+            const spark = activeComp.needsStageArt ? ' ✨' : '';
+            chips.push(el(doc, 'span', {
+                className: 'clodex-rp-chip clodex-rp-chip-cradle',
+            }, `🐣 ${activeComp.name} · ${stageLabel} · 💛${Math.round(activeComp.mood ?? 85)}%${spark}`));
+        }
+
         if (Array.isArray(state.customMeters)) {
             for (const m of state.customMeters.filter(item => item.showInHud).slice(0, 2)) {
                 chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, `${m.icon} ${m.label}: ${m.value}`));
@@ -2250,7 +3089,6 @@ function createRpStudioController(bridge) {
             }
             return false;
         }
-        const settings = bridge.getSettings();
         if (!catalog.length) await refreshAccount();
         const model = bridge.getSettings().trackerModel;
         if (!model) {
@@ -2259,6 +3097,7 @@ function createRpStudioController(bridge) {
             return false;
         }
         const rp = await bridge.getRpContext();
+        if (rp?.charName) currentCharName = rp.charName;
         if (!rp.recentMessages?.length) return false;
 
         busyState = 'tracker';
@@ -2309,6 +3148,7 @@ function createRpStudioController(bridge) {
         try {
             const state = bridge.getChatState();
             const rp = await bridge.getRpContext();
+            if (rp?.charName) currentCharName = rp.charName;
             const messages = buildCodexMessages({
                 preset: codexPreset,
                 customPrompt: codexCustomPrompt,
@@ -2339,6 +3179,7 @@ function createRpStudioController(bridge) {
     async function buildOrUseScenePrompt() {
         if (scenePromptDraft.trim()) return scenePromptDraft.trim();
         const rp = await bridge.getRpContext();
+        if (rp?.charName) currentCharName = rp.charName;
         const state = bridge.getChatState();
         const settings = bridge.getSettings();
         const promptModel = settings.trackerModel || settings.codexModel;
@@ -2376,7 +3217,12 @@ function createRpStudioController(bridge) {
             renderAll();
             return;
         }
-        if (!auto && settings.confirmPaid) {
+        let autoEst = 0;
+        if (auto) {
+            const guard = checkAutoSpendAllowed(model, 'image');
+            if (!guard.allowed) return;
+            autoEst = guard.est;
+        } else if (settings.confirmPaid) {
             const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'Image', model }));
             if (!ok) return;
         }
@@ -2403,7 +3249,11 @@ function createRpStudioController(bridge) {
             state.scene.turnsSinceAutoImage = 0;
             await bridge.saveChatState(state);
             sceneStatusText = t('scene.statusDone');
-            await refreshAccount().catch(() => {});
+            if (auto) {
+                await recordAutoSpendAndRefresh(autoEst);
+            } else {
+                await refreshAccount().catch(() => {});
+            }
         } catch (err) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
             sceneStatusText = '';
@@ -2530,6 +3380,7 @@ function createRpStudioController(bridge) {
         }
 
         const rp = await bridge.getRpContext();
+        if (rp?.charName) currentCharName = rp.charName;
         const rawSource = explicitText || rp.recentMessages?.filter(m => m.role === 'assistant').at(-1)?.content || '';
         const spoken = extractSpokenDialogue(rawSource, { dialogueOnly: settings.dialogueOnly !== false });
         if (!spoken) {
@@ -2541,7 +3392,12 @@ function createRpStudioController(bridge) {
         const charVoice = settings.voiceMap?.[rp.charName] || settings.defaultVoice || 'alloy';
         const safeVoice = isSafeVoiceId(charVoice) ? charVoice : 'alloy';
 
-        if (!auto && settings.confirmPaid) {
+        let autoEst = 0;
+        if (auto) {
+            const guard = checkAutoSpendAllowed(model, 'tts');
+            if (!guard.allowed) return '';
+            autoEst = guard.est;
+        } else if (settings.confirmPaid) {
             const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'TTS', model }));
             if (!ok) return '';
         }
@@ -2564,7 +3420,11 @@ function createRpStudioController(bridge) {
             state.scene.lastAudioPath = savedPath;
             await bridge.saveChatState(state);
             bridge.playAudioPreview?.(savedPath, audioBlob);
-            await refreshAccount().catch(() => {});
+            if (auto) {
+                await recordAutoSpendAndRefresh(autoEst);
+            } else {
+                await refreshAccount().catch(() => {});
+            }
             return savedPath;
         } catch (err) {
             if (!auto) errorBanner = redact(err?.message ?? err, key);
@@ -2573,6 +3433,233 @@ function createRpStudioController(bridge) {
             busyState = '';
             renderAll();
         }
+    }
+
+    async function generateCompanionPortrait(companion) {
+        const comp = companion || getActiveCompanion(bridge.getChatState());
+        if (!comp) return '';
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return '';
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.imageModel;
+        if (!model) {
+            errorBanner = 'Select an Image model (e.g. Nano Banana) in Key & Models.';
+            renderAll();
+            return '';
+        }
+        if (settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'Companion Portrait', model }));
+            if (!ok) return '';
+        }
+
+        activeAbort?.abort();
+        const abort = new AbortController();
+        activeAbort = abort;
+        busyState = 'comp_img';
+        cradleStatusText = t('cradle.statusPainting');
+        errorBanner = '';
+        renderAll();
+
+        try {
+            const rp = await bridge.getRpContext();
+            if (rp?.charName) currentCharName = rp.charName;
+            const prompt = buildCompanionPortraitPrompt(comp, {
+                charName: rp.charName,
+                charDescription: rp.charDescription,
+                userName: rp.userName,
+                stylePreset: sceneStyle,
+            });
+            const res = await api.image({ model, prompt }, abort.signal);
+            const blob = res.b64_json
+                ? base64ToBlob(res.b64_json, 'image/png')
+                : await api.downloadImage(res.url, abort.signal);
+            const base64 = res.b64_json || await blobToBase64(blob);
+            const savedPath = await saveCompanionAsset(comp.id, 'image', blob, base64);
+
+            const latestState = bridge.getChatState();
+            const target = (latestState.companions || []).find(c => c.id === comp.id);
+            if (target) {
+                target.portraitPath = savedPath;
+                target.needsStageArt = false;
+                await bridge.saveChatState(latestState);
+            }
+            cradleStatusText = t('cradle.statusDone');
+            await refreshAccount().catch(() => {});
+            return savedPath;
+        } catch (err) {
+            if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
+            cradleStatusText = '';
+            return '';
+        } finally {
+            if (activeAbort === abort) activeAbort = null;
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function generateCompanionVideo(companion, { resume = false } = {}) {
+        const comp = companion || getActiveCompanion(bridge.getChatState());
+        if (!comp) return '';
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return '';
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.videoModel;
+        if (!resume && !model) {
+            errorBanner = 'Select a Video model in Key & Models.';
+            renderAll();
+            return '';
+        }
+        if (!resume && settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'Companion Video', model }));
+            if (!ok) return '';
+        }
+
+        activeAbort?.abort();
+        const abort = new AbortController();
+        activeAbort = abort;
+        busyState = 'comp_vid';
+        errorBanner = '';
+        renderAll();
+
+        try {
+            let taskIdentifier = resume ? comp.videoTaskId : '';
+            if (!taskIdentifier) {
+                const prompt = buildCompanionVideoPrompt(comp);
+                let refDataUrl = '';
+                if (comp.portraitPath) {
+                    refDataUrl = /^data:image\//i.test(comp.portraitPath)
+                        ? comp.portraitPath
+                        : (await bridge.loadCurrentSceneImageDataUrl?.(comp.portraitPath).catch(() => '')) || '';
+                }
+                cradleStatusText = t('cradle.statusAnimating', { status: 'submitting' });
+                renderAll();
+                const created = await api.createVideo({ model, prompt, image: refDataUrl || undefined }, abort.signal);
+                taskIdentifier = created.id;
+                const midState = bridge.getChatState();
+                const midTarget = (midState.companions || []).find(c => c.id === comp.id);
+                if (midTarget) {
+                    midTarget.videoTaskId = taskIdentifier;
+                    await bridge.saveChatState(midState);
+                }
+            }
+
+            const videoBlob = await api.pollVideo(taskIdentifier, {
+                onProgress: st => {
+                    const pct = st.progress !== null ? `${Math.round(st.progress)}%` : st.status;
+                    cradleStatusText = t('cradle.statusAnimating', { status: pct });
+                    renderAll();
+                },
+            }, abort.signal);
+
+            const base64 = await blobToBase64(videoBlob);
+            const savedVideoPath = await saveCompanionAsset(comp.id, 'video', videoBlob, base64);
+            const latestState = bridge.getChatState();
+            const target = (latestState.companions || []).find(c => c.id === comp.id);
+            if (target) {
+                target.videoPath = savedVideoPath;
+                target.videoTaskId = '';
+                await bridge.saveChatState(latestState);
+            }
+            cradleStatusText = t('cradle.statusDone');
+            await refreshAccount().catch(() => {});
+            return savedVideoPath;
+        } catch (err) {
+            if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
+            return '';
+        } finally {
+            if (activeAbort === abort) activeAbort = null;
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function speakCompanionReaction(companion) {
+        const comp = companion || getActiveCompanion(bridge.getChatState());
+        if (!comp) return '';
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return '';
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const textModel = settings.trackerModel || settings.codexModel;
+        const speechModel = settings.speechModel;
+        if (!textModel || !speechModel) {
+            errorBanner = 'Select Text and Voice (TTS) models in Key & Models.';
+            renderAll();
+            return '';
+        }
+        if (settings.confirmPaid) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', { kind: 'Companion Voice', model: speechModel }));
+            if (!ok) return '';
+        }
+
+        busyState = 'comp_tts';
+        cradleStatusText = t('cradle.statusSpeaking');
+        errorBanner = '';
+        renderAll();
+        try {
+            const rp = await bridge.getRpContext();
+            if (rp?.charName) currentCharName = rp.charName;
+            const messages = buildCompanionBabbleMessages(comp, {
+                charName: rp.charName,
+                userName: rp.userName,
+                locale: bridge.getLocale(),
+            });
+            const rawLine = await api.chat({ model: textModel, messages, temperature: 0.7, maxTokens: 160 });
+            companionReactionMap.set(comp.id, rawLine);
+
+            const spoken = extractSpokenDialogue(rawLine, { dialogueOnly: true })
+                || extractSpokenDialogue(rawLine, { dialogueOnly: false })
+                || rawLine;
+            const rawVoice = comp.voiceId || settings.defaultVoice || 'alloy';
+            const safeVoice = isSafeVoiceId(rawVoice) ? rawVoice : 'alloy';
+
+            const audioBlob = await api.speech({ model: speechModel, input: spoken, voice: safeVoice });
+            const base64 = await blobToBase64(audioBlob);
+            const savedAudioPath = await saveCompanionAsset(comp.id, 'audio', audioBlob, base64);
+            companionAudioMap.set(comp.id, savedAudioPath);
+            bridge.playAudioPreview?.(savedAudioPath, audioBlob);
+            cradleStatusText = '';
+            await refreshAccount().catch(() => {});
+            return savedAudioPath;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, key);
+            cradleStatusText = '';
+            return '';
+        } finally {
+            busyState = '';
+            renderAll();
+        }
+    }
+
+    async function graduateCompanionToForge(companion) {
+        const comp = companion || getActiveCompanion(bridge.getChatState());
+        if (!comp) return '';
+        const rp = await bridge.getRpContext?.().catch(() => ({}));
+        if (rp?.charName) currentCharName = rp.charName;
+        const locale = bridge.getLocale() === 'ru' ? 'ru' : 'en';
+        forgeConcept = buildCompanionForgeConcept(comp, {
+            charName: rp?.charName || '',
+            userName: rp?.userName || '',
+            locale,
+        });
+        forgeLang = locale;
+        activeTab = 'forge';
+        toggleDrawer(true);
+        return forgeConcept;
     }
 
     async function runCharacterForge() {
@@ -2657,6 +3744,32 @@ function createRpStudioController(bridge) {
             select.append(o);
         }
         return select;
+    }
+
+    async function adoptChildIntoCradle(child, state) {
+        if (!Array.isArray(state.companions)) state.companions = [];
+        const existing = state.companions.find(c => c.originChildId === child.id);
+        if (existing) {
+            activeCompanionId = existing.id;
+            activeTab = 'cradle';
+            renderAll();
+            return existing;
+        }
+        if (state.companions.length >= 6) {
+            errorBanner = t('cradle.maxReached');
+            renderAll();
+            return null;
+        }
+        const created = createCompanionFromOffspring(child, state, { locale: bridge.getLocale() });
+        if (created && !state.companions.some(c => c.id === created.id || (created.originChildId && c.originChildId === created.originChildId))) {
+            state.companions.push(created);
+        }
+        if (created) activeCompanionId = created.id;
+        errorBanner = '';
+        await bridge.saveChatState(state);
+        activeTab = 'cradle';
+        renderAll();
+        return created;
     }
 
     function renderTrackerTab(state) {
@@ -3314,16 +4427,18 @@ function createRpStudioController(bridge) {
                 }
             }
 
-            // Family tree
+            // Family tree with 1-click Cradle transfer
             bioCard.append(el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
                 el(doc, 'strong', {}, `🌳 ${t('bio.familyTitle')}`),
                 state.offspring.length === 0
                     ? el(doc, 'div', { className: 'clodex-rp-muted' }, t('bio.noOffspring'))
-                    : el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' }, ...state.offspring.map(child =>
-                        el(doc, 'div', { className: 'clodex-rp-list-item' },
+                    : el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' }, ...state.offspring.map(child => {
+                        const inCradle = (state.companions || []).some(c => c.originChildId === child.id);
+                        return el(doc, 'div', { className: 'clodex-rp-list-item' },
                             el(doc, 'input', {
                                 type: 'text',
                                 className: 'clodex-rp-input',
+                                style: 'flex:1;min-width:90px',
                                 placeholder: t('bio.childNamePlaceholder'),
                                 value: child.name,
                                 onChange: async e => {
@@ -3332,7 +4447,13 @@ function createRpStudioController(bridge) {
                                 },
                             }),
                             el(doc, 'span', { className: 'clodex-rp-muted' }, `${t(`bio.gender.${child.gender}`)} · ${child.bornDate}`),
-                        ))),
+                            el(doc, 'button', {
+                                type: 'button',
+                                className: 'clodex-rp-btn-mini',
+                                onClick: () => adoptChildIntoCradle(child, state),
+                            }, inCradle ? `✅ ${t('cradle.adoptedBadge')}` : `🐣 ${t('cradle.adoptBtn')}`),
+                        );
+                    })),
             ));
 
             container.append(bioCard);
@@ -3476,6 +4597,329 @@ function createRpStudioController(bridge) {
             ),
         );
         container.append(metersCard);
+
+        return container;
+    }
+
+    function renderCradleTab(state) {
+        if (!Array.isArray(state.companions)) state.companions = [];
+        const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+
+        if (state.world.pendingMemoryHint) {
+            container.append(el(doc, 'div', { className: 'clodex-rp-banner' },
+                el(doc, 'span', {}, `🧠 ${t('codex.memoryBanner', { hint: state.world.pendingMemoryHint.slice(0, 120) })}`),
+                el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-btn-mini',
+                    onClick: async () => {
+                        state.world.pendingMemoryHint = '';
+                        await bridge.saveChatState(state);
+                        renderAll();
+                    },
+                }, t('codex.clearMemory')),
+            ));
+        }
+
+        const archetypeIds = Array.isArray(COMPANION_ARCHETYPES)
+            ? COMPANION_ARCHETYPES.map(item => (typeof item === 'string' ? item : item?.id)).filter(Boolean)
+            : Object.keys(ARCHETYPE_ICONS);
+
+        const activeComp = getActiveCompanion(state);
+
+        // Summon & Offspring Adoption Card
+        const summonCard = el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'h4', { className: 'clodex-rp-card-title' }, `🐣 ${t('cradle.title')}`),
+            el(doc, 'p', { className: 'clodex-rp-muted' }, t('cradle.subtitle')),
+            state.companions.length > 0 ? el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                ...state.companions.map(comp => {
+                    const stKey = COMPANION_STAGES.includes(comp.stage) ? comp.stage : 'infant';
+                    return el(doc, 'button', {
+                        type: 'button',
+                        className: `clodex-rp-chip-btn ${activeComp?.id === comp.id ? 'active' : ''}`,
+                        onClick: () => {
+                            activeCompanionId = comp.id;
+                            renderDrawer();
+                        },
+                    }, `${ARCHETYPE_ICONS[comp.archetype] || '🐣'} ${comp.name} · ${t(`cradle.stage.${stKey}`)}${comp.needsStageArt ? ' ✨' : ''}`);
+                }),
+            ) : null,
+            el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+                el(doc, 'strong', {}, `✨ ${t('cradle.summonTitle')}`),
+                el(doc, 'input', {
+                    type: 'text',
+                    className: 'clodex-rp-input clodex-rp-mt',
+                    placeholder: t('cradle.namePlaceholder'),
+                    value: companionNameDraft,
+                    onInput: e => { companionNameDraft = e.target.value; },
+                }),
+                el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                    ...archetypeIds.map(archId => el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-chip-btn',
+                        onClick: async () => {
+                            if (state.companions.length >= 6) {
+                                errorBanner = t('cradle.maxReached');
+                                renderDrawer();
+                                return;
+                            }
+                            const created = createCompanionFromArchetype(archId, {
+                                customName: companionNameDraft.trim(),
+                                locale: bridge.getLocale(),
+                            });
+                            state.companions.push(created);
+                            activeCompanionId = created.id;
+                            companionNameDraft = '';
+                            errorBanner = '';
+                            await bridge.saveChatState(state);
+                            renderAll();
+                        },
+                    }, `${ARCHETYPE_ICONS[archId] || '🐾'} ${archId in ARCHETYPE_ICONS ? t(`cradle.archetype.${archId}`) : archId}`)),
+                ),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+                el(doc, 'strong', {}, `🌳 ${t('cradle.offspringTitle')}`),
+                !state.offspring?.length
+                    ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('cradle.offspringEmpty'))
+                    : el(doc, 'div', { className: 'clodex-rp-list clodex-rp-mt' },
+                        ...state.offspring.map(child => {
+                            const linked = state.companions.find(c => c.originChildId === child.id);
+                            return el(doc, 'div', { className: 'clodex-rp-list-item' },
+                                el(doc, 'span', {}, `${child.name || '—'} (${t(`bio.gender.${child.gender}`)} · ${child.bornDate})`),
+                                el(doc, 'button', {
+                                    type: 'button',
+                                    className: linked ? 'clodex-rp-btn-mini' : 'clodex-rp-btn-mini active',
+                                    onClick: () => adoptChildIntoCradle(child, state),
+                                }, linked ? `✅ ${t('cradle.adoptedBadge')}` : `🐣 ${t('cradle.adoptBtn')}`),
+                            );
+                        }),
+                    ),
+            ),
+        );
+        container.append(summonCard);
+
+        if (!activeComp) {
+            container.append(el(doc, 'div', { className: 'clodex-rp-card clodex-rp-muted' }, t('cradle.emptyState')));
+            return container;
+        }
+
+        // Active Companion Card (Next-Gen Multimodal Tamagotchi)
+        const vidSrc = bridge.resolveMediaSrc?.(activeComp.videoPath) || activeComp.videoPath || '';
+        const imgSrc = bridge.resolveMediaSrc?.(activeComp.portraitPath) || activeComp.portraitPath || '';
+        const mediaNode = vidSrc
+            ? el(doc, 'video', {
+                className: 'clodex-rp-comp-media',
+                src: vidSrc,
+                poster: imgSrc || undefined,
+                autoplay: true,
+                loop: true,
+                muted: true,
+                playsInline: true,
+                controls: true,
+            })
+            : imgSrc
+                ? el(doc, 'img', {
+                    className: 'clodex-rp-comp-media',
+                    src: imgSrc,
+                    alt: activeComp.name,
+                })
+                : el(doc, 'div', { className: 'clodex-rp-comp-placeholder' }, ARCHETYPE_ICONS[activeComp.archetype] || '🐣');
+
+        const safeStage = COMPANION_STAGES.includes(activeComp.stage) ? activeComp.stage : 'infant';
+        const genderIcon = activeComp.gender === 'female' ? '♀' : activeComp.gender === 'male' ? '♂' : '✦';
+        const traits = Array.isArray(activeComp.traits) ? activeComp.traits.filter(Boolean) : [];
+
+        const voiceOpts = [
+            { value: '', label: t('cradle.voiceDefault') },
+            ...voiceList.map(v => ({ value: v.id, label: v.name })),
+        ];
+        if (activeComp.voiceId && !voiceOpts.some(o => o.value === activeComp.voiceId)) {
+            voiceOpts.push({ value: activeComp.voiceId, label: activeComp.voiceId });
+        }
+
+        const statDefs = [
+            ['fullness', '🍼', activeComp.fullness ?? 85],
+            ['mood', '💛', activeComp.mood ?? 85],
+            ['bond', '🔗', activeComp.bond ?? 35],
+            ['energy', '⚡', activeComp.energy ?? 90],
+        ];
+
+        const careActions = [
+            ['feed', '🍼'],
+            ['pet', '🤚'],
+            ['train', '⚔️'],
+            ['play', '🎲'],
+            ['rest', '🌙'],
+        ];
+
+        const reactionLine = companionReactionMap.get(activeComp.id) || '';
+        const rawCompAudio = companionAudioMap.get(activeComp.id) || '';
+        const compAudioSrc = bridge.resolveMediaSrc?.(rawCompAudio) || rawCompAudio;
+
+        container.append(el(doc, 'div', { className: 'clodex-rp-card' },
+            el(doc, 'div', { className: 'clodex-rp-comp-hero' },
+                mediaNode,
+                el(doc, 'div', { style: 'flex:1;min-width:0' },
+                    el(doc, 'div', { className: 'clodex-rp-list-item' },
+                        el(doc, 'strong', {}, `${genderIcon} ${activeComp.name}`),
+                        el(doc, 'div', { className: 'clodex-rp-head-actions' },
+                            el(doc, 'span', { className: 'clodex-rp-muted' }, t('cradle.ageDays', { days: activeComp.ageDays ?? 0 })),
+                            el(doc, 'button', {
+                                type: 'button',
+                                className: 'clodex-rp-btn-mini',
+                                title: t('cradle.removeBtn'),
+                                onClick: async () => {
+                                    state.companions = state.companions.filter(c => c.id !== activeComp.id);
+                                    activeCompanionId = state.companions[0]?.id || '';
+                                    await bridge.saveChatState(state);
+                                    renderAll();
+                                },
+                            }, '✕'),
+                        ),
+                    ),
+                    el(doc, 'div', { className: 'clodex-rp-stage-steps' },
+                        ...COMPANION_STAGES.map(st => el(doc, 'span', {
+                            className: `clodex-rp-stage-pill ${safeStage === st ? 'active' : ''}`,
+                        }, t(`cradle.stage.${st}`))),
+                    ),
+                    activeComp.needsStageArt
+                        ? el(doc, 'div', { className: 'clodex-rp-badge-line clodex-rp-mt' }, `✨ ${t('cradle.stageArtBadge')}`)
+                        : null,
+                    el(doc, 'div', { className: 'clodex-rp-mt' },
+                        el(doc, 'div', { className: 'clodex-rp-muted' }, t('cradle.traitsLabel')),
+                        traits.length === 0
+                            ? el(doc, 'span', { className: 'clodex-rp-muted' }, t('cradle.noTraits'))
+                            : el(doc, 'div', { className: 'clodex-rp-chips clodex-rp-mt' },
+                                ...traits.map(tr => el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, String(tr)))),
+                    ),
+                ),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('cradle.nameLabel')),
+                    el(doc, 'input', {
+                        type: 'text',
+                        className: 'clodex-rp-input',
+                        value: activeComp.name,
+                        onChange: async e => {
+                            const nextName = e.target.value.trim().slice(0, 60);
+                            if (nextName) activeComp.name = nextName;
+                            await bridge.saveChatState(state);
+                            renderAll();
+                        },
+                    }),
+                ),
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, t('cradle.voiceLabel')),
+                    el(doc, 'div', { className: 'clodex-rp-btn-row', style: 'flex-wrap:nowrap' },
+                        voiceList.length > 0
+                            ? buildSelect(voiceOpts, activeComp.voiceId || '', async val => {
+                                activeComp.voiceId = val;
+                                await bridge.saveChatState(state);
+                                renderDrawer();
+                            })
+                            : el(doc, 'input', {
+                                type: 'text',
+                                className: 'clodex-rp-input',
+                                placeholder: t('voice.voicePlaceholder'),
+                                value: activeComp.voiceId || '',
+                                onChange: async e => {
+                                    activeComp.voiceId = e.target.value.trim().slice(0, 120);
+                                    await bridge.saveChatState(state);
+                                },
+                            }),
+                        el(doc, 'button', {
+                            type: 'button',
+                            className: 'clodex-rp-btn-mini',
+                            disabled: busyState === 'voices',
+                            title: t('voice.loadVoices'),
+                            onClick: () => loadSpeechVoices(),
+                        }, '🎙'),
+                    ),
+                ),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-stats-grid' },
+                ...statDefs.map(([statKey, icon, rawVal]) => {
+                    const pct = Math.max(0, Math.min(100, Math.round(Number(rawVal) || 0)));
+                    return el(doc, 'div', { className: 'clodex-rp-stat-item' },
+                        el(doc, 'div', { className: 'clodex-rp-stat-head' },
+                            el(doc, 'span', {}, `${icon} ${t(`cradle.stat.${statKey}`)}`),
+                            el(doc, 'strong', {}, `${pct}%`),
+                        ),
+                        el(doc, 'div', { className: 'clodex-rp-stat-bar' },
+                            el(doc, 'div', {
+                                className: `clodex-rp-stat-fill is-${statKey}`,
+                                style: `width:${pct}%`,
+                            }),
+                        ),
+                    );
+                }),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+                el(doc, 'strong', {}, `💞 ${t('cradle.careTitle')}`),
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    ...careActions.map(([act, icon]) => el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        onClick: async () => {
+                            const res = interactWithCompanion(activeComp, act, { rpDate: state.world.rpDate });
+                            const updated = res?.companion ?? activeComp;
+                            const idx = state.companions.findIndex(c => c.id === activeComp.id);
+                            if (idx >= 0) state.companions[idx] = updated;
+                            if (res?.memoryHint) {
+                                state.world.pendingMemoryHint = res.memoryHint;
+                            }
+                            await bridge.saveChatState(state);
+                            bridge.notify?.(t('cradle.careNotice', { name: updated.name }));
+                            renderAll();
+                        },
+                    }, `${icon} ${t(`cradle.action.${act}`)}`)),
+                ),
+            ),
+            el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
+                el(doc, 'strong', {}, `✨ ${t('cradle.mediaTitle')}`),
+                cradleStatusText ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, cradleStatusText) : null,
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-primary',
+                        disabled: busyState.startsWith('comp_'),
+                        onClick: () => generateCompanionPortrait(activeComp),
+                    }, `🍌 ${t('cradle.genPortrait')}`),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        disabled: busyState.startsWith('comp_'),
+                        onClick: () => generateCompanionVideo(activeComp, { resume: false }),
+                    }, `🎬 ${t('cradle.genVideo')}`),
+                    activeComp.videoTaskId ? el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        disabled: busyState.startsWith('comp_'),
+                        onClick: () => generateCompanionVideo(activeComp, { resume: true }),
+                    }, t('scene.resumeVideo')) : null,
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn',
+                        disabled: busyState.startsWith('comp_'),
+                        onClick: () => speakCompanionReaction(activeComp),
+                    }, `🔊 ${t('cradle.speakBtn')}`),
+                ),
+                reactionLine ? el(doc, 'div', { className: 'clodex-rp-speech-bubble' }, reactionLine) : null,
+                compAudioSrc ? el(doc, 'audio', {
+                    className: 'clodex-rp-audio',
+                    controls: true,
+                    autoplay: true,
+                    src: compAudioSrc,
+                }) : null,
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-dynasty',
+                        onClick: () => graduateCompanionToForge(activeComp),
+                    }, `🎓 ${t('cradle.graduateBtn')}`),
+                ),
+            ),
+        ));
 
         return container;
     }
@@ -3741,9 +5185,14 @@ function createRpStudioController(bridge) {
             ),
         ));
 
-        // Character Voice (CLODEx TTS) Card
+        // Character Voice (CLODEx TTS) Card — binds to both defaultVoice and voiceMap[rp.charName]
         const audioSrc = bridge.resolveMediaSrc?.(state.scene.lastAudioPath) || state.scene.lastAudioPath || '';
-        const currentVoice = settings.defaultVoice || 'alloy';
+        const currentVoice = (currentCharName && settings.voiceMap?.[currentCharName]) || settings.defaultVoice || 'alloy';
+        const sceneVoiceOptions = voiceList.map(v => ({ value: v.id, label: v.name }));
+        if (currentVoice && !sceneVoiceOptions.some(o => o.value === currentVoice)) {
+            sceneVoiceOptions.unshift({ value: currentVoice, label: currentVoice });
+        }
+
         container.append(el(doc, 'div', { className: 'clodex-rp-card' },
             el(doc, 'h4', { className: 'clodex-rp-card-title' }, `🔊 ${t('voice.title')}`),
             el(doc, 'div', { className: 'clodex-rp-grid-2' },
@@ -3751,10 +5200,10 @@ function createRpStudioController(bridge) {
                     el(doc, 'span', {}, t('voice.voiceSelect')),
                     voiceList.length > 0
                         ? buildSelect(
-                            voiceList.map(v => ({ value: v.id, label: v.name })),
+                            sceneVoiceOptions,
                             currentVoice,
                             async val => {
-                                await bridge.updateSettings({ defaultVoice: val });
+                                await saveCharacterVoiceSelection(val);
                                 renderDrawer();
                             },
                         )
@@ -3764,7 +5213,8 @@ function createRpStudioController(bridge) {
                             placeholder: t('voice.voicePlaceholder'),
                             value: currentVoice,
                             onChange: async e => {
-                                await bridge.updateSettings({ defaultVoice: e.target.value.trim() || 'alloy' });
+                                await saveCharacterVoiceSelection(e.target.value);
+                                renderDrawer();
                             },
                         }),
                 ),
@@ -3939,6 +5389,10 @@ function createRpStudioController(bridge) {
             return opts;
         };
 
+        const autoCap = Number.isFinite(Number(settings.maxAutoSpendUsd ?? 0.25))
+            ? Math.max(0, Number(settings.maxAutoSpendUsd ?? 0.25))
+            : 0.25;
+
         container.append(el(doc, 'div', { className: 'clodex-rp-card' },
             el(doc, 'h4', { className: 'clodex-rp-card-title' }, `🔑 ${t('account.title')}`),
             inherited ? el(doc, 'div', { className: 'clodex-rp-badge-line' }, `✅ ${t('account.inheritedBadge')}`) : null,
@@ -3973,6 +5427,21 @@ function createRpStudioController(bridge) {
                 videoBilling?.paidUSD !== null && videoBilling?.paidUSD !== undefined
                     ? el(doc, 'div', { className: 'clodex-rp-muted' }, t('account.videoPaidNote', { usd: formatUsd(videoBilling.paidUSD) }))
                     : null,
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    el(doc, 'span', { className: 'clodex-rp-muted' }, `🛡️ ${t('account.sessionAutoSpend', {
+                        spent: formatUsd(sessionAutoSpendUsd),
+                        cap: formatUsd(autoCap),
+                    })}`),
+                    sessionAutoSpendUsd > 0 ? el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn-mini',
+                        onClick: () => {
+                            sessionAutoSpendUsd = 0;
+                            errorBanner = '';
+                            renderDrawer();
+                        },
+                    }, t('account.resetAutoSpend')) : null,
+                ),
             ),
             el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
                 el(doc, 'label', { className: 'clodex-rp-field' },
@@ -4003,6 +5472,23 @@ function createRpStudioController(bridge) {
                     el(doc, 'span', {}, t('account.speechModel')),
                     buildSelect(modelOptions(speechModels.length ? speechModels : catalog, settings.speechModel), settings.speechModel, async v => {
                         await bridge.updateSettings({ speechModel: v });
+                    }),
+                ),
+                el(doc, 'label', { className: 'clodex-rp-field' },
+                    el(doc, 'span', {}, `🛡️ ${t('account.maxAutoSpend')}`),
+                    el(doc, 'input', {
+                        type: 'number',
+                        min: 0,
+                        max: 50,
+                        step: 0.05,
+                        className: 'clodex-rp-input',
+                        value: autoCap,
+                        onChange: async e => {
+                            const raw = Number(e.target.value);
+                            const clean = Number.isFinite(raw) ? Math.max(0, Math.min(50, raw)) : 0.25;
+                            await bridge.updateSettings({ maxAutoSpendUsd: clean });
+                            renderDrawer();
+                        },
                     }),
                 ),
             ),
@@ -4050,19 +5536,20 @@ function createRpStudioController(bridge) {
         if (!drawerOpen) return;
         const state = bridge.getChatState();
 
+        // Mobile discipline: strictly 4 primary tabs in 1 row even on 390px screens
         const tabs = [
             ['tracker', `🧬 ${t('tab.tracker')}`],
+            ['cradle', `🐣 ${t('tab.cradle')}`],
             ['codex', `📜 ${t('tab.codex')}`],
             ['scene', `🍌 ${t('tab.scene')}`],
-            ['forge', `⚒️ ${t('tab.forge')}`],
-            ['account', `🔑 ${t('tab.account')}`],
         ];
 
-        const body = activeTab === 'codex' ? renderCodexTab(state)
-            : activeTab === 'scene' ? renderSceneTab(state)
-                : activeTab === 'forge' ? renderForgeTab()
-                    : activeTab === 'account' ? renderAccountTab()
-                        : renderTrackerTab(state);
+        const body = activeTab === 'cradle' ? renderCradleTab(state)
+            : activeTab === 'codex' ? renderCodexTab(state)
+                : activeTab === 'scene' ? renderSceneTab(state)
+                    : activeTab === 'forge' ? renderForgeTab()
+                        : activeTab === 'account' ? renderAccountTab()
+                            : renderTrackerTab(state);
 
         drawerPanel.replaceChildren(
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
@@ -4070,17 +5557,41 @@ function createRpStudioController(bridge) {
                 el(doc, 'div', { className: 'clodex-rp-head-actions' },
                     el(doc, 'button', {
                         type: 'button',
+                        className: `clodex-rp-btn-mini ${activeTab === 'forge' ? 'active' : ''}`,
+                        title: t('tab.forge'),
+                        'aria-label': t('tab.forge'),
+                        onClick: () => {
+                            activeTab = 'forge';
+                            renderDrawer();
+                        },
+                    }, '⚒️'),
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: `clodex-rp-btn-mini ${activeTab === 'account' ? 'active' : ''}`,
+                        title: t('tab.account'),
+                        'aria-label': t('tab.account'),
+                        onClick: () => {
+                            activeTab = 'account';
+                            renderDrawer();
+                        },
+                    }, '🔑'),
+                    el(doc, 'button', {
+                        type: 'button',
                         className: 'clodex-rp-btn-mini',
+                        title: t('drawer.resetPos'),
+                        'aria-label': t('drawer.resetPos'),
                         onClick: () => {
                             bridge.saveHudPosition?.(null);
                             applyPillPosition(null);
                         },
-                    }, t('drawer.resetPos')),
+                    }, '⌖'),
                     el(doc, 'button', {
                         type: 'button',
                         className: 'clodex-rp-btn-mini',
+                        title: t('drawer.close'),
+                        'aria-label': t('drawer.close'),
                         onClick: () => toggleDrawer(false),
-                    }, `✕ ${t('drawer.close')}`),
+                    }, '✕'),
                 ),
             ),
             el(doc, 'nav', { className: 'clodex-rp-tabs' },
@@ -4089,6 +5600,7 @@ function createRpStudioController(bridge) {
                     className: `clodex-rp-tab-btn ${activeTab === id ? 'active' : ''}`,
                     onClick: () => {
                         activeTab = id;
+                        if (id === 'scene') syncCachedCharName();
                         renderDrawer();
                     },
                 }, label)),
@@ -4140,6 +5652,7 @@ function createRpStudioController(bridge) {
     // Initial render & background catalog load if key already present
     renderAll();
     applyPillPosition(bridge.loadHudPosition?.());
+    syncCachedCharName();
     if (bridge.getEffectiveKey()) {
         refreshAccount().catch(() => {});
     }
@@ -4154,12 +5667,21 @@ function createRpStudioController(bridge) {
         syncTrackerFromChat,
         generateSceneBackground,
         speakLatestReply,
+        generateCompanionPortrait,
+        generateCompanionVideo,
+        speakCompanionReaction,
+        graduateCompanionToForge,
         runCharacterForge,
         onAssistantMessageCommitted,
         refreshAccount,
+        getSessionAutoSpendUsd: () => sessionAutoSpendUsd,
         dispose() {
             activeAbort?.abort();
             if (activeAudioUrl) URL.revokeObjectURL(activeAudioUrl);
+            for (const u of companionObjectUrls) {
+                try { URL.revokeObjectURL(u); } catch {}
+            }
+            companionObjectUrls.length = 0;
             unsubLocale?.();
             unsubInsets?.();
             win.removeEventListener?.('resize', onResize);
@@ -4173,12 +5695,19 @@ function createRpStudioController(bridge) {
 
 
 
-const CHAT_VAR_KEY = 'clodex_rp_state';
-const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
-
 (async function bootstrapTavoHud() {
+    const CHAT_VAR_KEY = 'clodex_rp_state';
+    const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
+
+    function normalizeMaxAutoSpend(val) {
+        if (val === undefined || val === null || val === '') return 0.25;
+        const num = Number(val);
+        return Number.isFinite(num) && num >= 0 ? num : 0.25;
+    }
+
     const mountContainer = document.getElementById('clodex-rp-tavo-mount') || document.body;
     const i18n = tavo.plugin.i18n;
+    const lastCompanionMediaSlot = Object.create(null);
 
     let cachedState = createChatState();
     let cachedPrefs = {
@@ -4195,6 +5724,7 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
         autoTrack: tavo.plugin.config.get('autoTrack') !== false,
         injectContext: tavo.plugin.config.get('injectContext') !== false,
         confirmPaid: tavo.plugin.config.get('confirmPaid') !== false,
+        maxAutoSpendUsd: 0.25,
         autoImageEvery: 0,
         bgDim: Number(tavo.plugin.config.get('bgDim') ?? 35),
         hudPos: null,
@@ -4213,7 +5743,11 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
             cachedState.world.enableAdultBiology = Boolean(tavo.plugin.config.get('enableAdultBio'));
         }
         if (rawPrefs && typeof rawPrefs === 'object') {
-            cachedPrefs = { ...cachedPrefs, ...rawPrefs };
+            cachedPrefs = {
+                ...cachedPrefs,
+                ...rawPrefs,
+                maxAutoSpendUsd: normalizeMaxAutoSpend(rawPrefs.maxAutoSpendUsd ?? cachedPrefs.maxAutoSpendUsd),
+            };
         }
     }
 
@@ -4240,6 +5774,8 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
             for (const [k, v] of Object.entries(patch)) {
                 if (k === 'apiKey') {
                     cachedPrefs.apiKey = v ? validateKey(v) : '';
+                } else if (k === 'maxAutoSpendUsd') {
+                    cachedPrefs.maxAutoSpendUsd = normalizeMaxAutoSpend(v);
                 } else {
                     cachedPrefs[k] = v;
                 }
@@ -4279,14 +5815,21 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
         },
         resolveMediaSrc(virtualPath) {
             if (!virtualPath) return '';
+            if (typeof tavo.file?.url === 'function' && !/^(https?:|data:|blob:)/i.test(virtualPath)) {
+                try {
+                    return tavo.file.url(virtualPath, { scope: 'chat' }) || virtualPath;
+                } catch {
+                    return virtualPath;
+                }
+            }
             return virtualPath;
         },
         async applyImageBackground({ base64 }) {
             const prev = cachedState.scene?.imagePath;
             const nextName = prev?.endsWith('bg-a.png') ? 'clodex-rp-bg-b.png' : 'clodex-rp-bg-a.png';
             const oldName = nextName === 'clodex-rp-bg-a.png' ? 'clodex-rp-bg-b.png' : 'clodex-rp-bg-a.png';
-            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64' });
-            await tavo.file.delete(oldName).catch(() => {});
+            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64', scope: 'chat' });
+            await tavo.file.delete(oldName, { scope: 'chat' }).catch(() => {});
             const opacity = Math.max(0.2, Math.min(1, 1 - Number(cachedPrefs.bgDim ?? 35) / 140));
             await tavo.chat.update({ background: { image: savedPath, opacity } });
             return savedPath;
@@ -4295,40 +5838,73 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
             const prev = cachedState.scene?.videoPath;
             const nextName = prev?.endsWith('bg-a.mp4') ? 'clodex-rp-bg-b.mp4' : 'clodex-rp-bg-a.mp4';
             const oldName = nextName === 'clodex-rp-bg-a.mp4' ? 'clodex-rp-bg-b.mp4' : 'clodex-rp-bg-a.mp4';
-            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64' });
-            await tavo.file.delete(oldName).catch(() => {});
+            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64', scope: 'chat' });
+            await tavo.file.delete(oldName, { scope: 'chat' }).catch(() => {});
             return savedPath;
         },
         async clearSceneBackground() {
             await tavo.chat.update({ background: null }).catch(() => {});
             for (const f of ['clodex-rp-bg-a.png', 'clodex-rp-bg-b.png', 'clodex-rp-bg-a.mp4', 'clodex-rp-bg-b.mp4']) {
-                await tavo.file.delete(f).catch(() => {});
+                await tavo.file.delete(f, { scope: 'chat' }).catch(() => {});
             }
         },
         async loadCurrentSceneImageDataUrl(currentPath) {
-            const target = currentPath || cachedState.scene?.imagePath || '';
+            const target = currentPath !== undefined ? String(currentPath ?? '') : String(cachedState.scene?.imagePath ?? '');
             if (!target) return '';
-            if (!await tavo.file.exists(target).catch(() => false)) return '';
-            const b64 = await tavo.file.load(target, { encoding: 'base64' }).catch(() => null);
+            if (/^data:image\//i.test(target)) return target;
+            if (!await tavo.file.exists(target, { scope: 'chat' }).catch(() => false)) return '';
+            const b64 = await tavo.file.load(target, { encoding: 'base64', scope: 'chat' }).catch(() => null);
             return b64 ? `data:image/png;base64,${b64}` : '';
         },
         async saveSpeechAudio({ base64 }) {
             const prev = cachedState.scene?.lastAudioPath;
             const nextName = prev?.endsWith('tts-a.mp3') ? 'clodex-rp-tts-b.mp3' : 'clodex-rp-tts-a.mp3';
             const oldName = nextName === 'clodex-rp-tts-a.mp3' ? 'clodex-rp-tts-b.mp3' : 'clodex-rp-tts-a.mp3';
-            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64' });
-            await tavo.file.delete(oldName).catch(() => {});
+            const savedPath = await tavo.file.save(nextName, base64, { encoding: 'base64', scope: 'chat' });
+            await tavo.file.delete(oldName, { scope: 'chat' }).catch(() => {});
+            return savedPath;
+        },
+        async saveCompanionMedia({ companionId, kind = 'image', blob, base64 } = {}) {
+            const safeId = String(companionId || 'main').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'main';
+            const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : 'png';
+            let rawB64 = typeof base64 === 'string' && base64.trim()
+                ? base64.replace(/^data:[^;]+;base64,/, '').trim()
+                : '';
+            if (!rawB64 && blob) {
+                rawB64 = await blobToBase64(blob);
+            }
+            if (!rawB64) throw new Error('Companion media payload is empty.');
+
+            const comp = Array.isArray(cachedState.companions)
+                ? cachedState.companions.find(item => item && String(item.id) === String(companionId))
+                : null;
+            const statePrev = kind === 'video'
+                ? comp?.videoPath
+                : kind === 'image'
+                    ? comp?.portraitPath
+                    : '';
+            const slotKey = `${safeId}:${ext}`;
+            const prev = String(statePrev || lastCompanionMediaSlot[slotKey] || '');
+            const nameA = `clodex-comp-${safeId}-a.${ext}`;
+            const nameB = `clodex-comp-${safeId}-b.${ext}`;
+            const nextName = prev.endsWith(`-a.${ext}`) ? nameB : nameA;
+            const oldName = nextName === nameA ? nameB : nameA;
+
+            const savedPath = await tavo.file.save(nextName, rawB64, { encoding: 'base64', scope: 'chat' });
+            lastCompanionMediaSlot[slotKey] = nextName;
+            await tavo.file.delete(oldName, { scope: 'chat' }).catch(() => {});
             return savedPath;
         },
         playAudioPreview(path) {
             if (!path || typeof Audio !== 'function') return;
-            const audio = new Audio(path);
+            const resolved = bridge.resolveMediaSrc(path);
+            const audio = new Audio(resolved);
             audio.play().catch(() => {});
         },
         async importForgedCharacter({ base64Png, fileName, card }) {
             const safeName = String(fileName || 'clodex-forged-card.png').replace(/[^a-zA-Z0-9._-]/g, '_');
             if (tavo.file?.save && tavo.character?.import) {
-                const savedPath = await tavo.file.save(safeName, base64Png, { encoding: 'base64' });
+                const savedPath = await tavo.file.save(safeName, base64Png, { encoding: 'base64', scope: 'chat' });
                 return await tavo.character.import(savedPath);
             }
             if (tavo.character?.import) {
@@ -4364,6 +5940,7 @@ const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
     tavo.plugin.on('clodex-command', async payload => {
         const action = payload?.action;
         if (action === 'open-tracker') controller.openTab('tracker');
+        else if (action === 'open-cradle') controller.openTab('cradle');
         else if (action === 'open-codex') controller.openTab('codex');
         else if (action === 'open-forge') controller.openTab('forge');
         else if (action === 'sync-tracker') {

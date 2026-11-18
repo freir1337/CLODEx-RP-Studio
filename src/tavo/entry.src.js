@@ -4,6 +4,15 @@ import { buildSystemContext } from '../core/prompts.js';
 
 const CHAT_VAR_KEY = 'clodex_rp_state';
 const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
+let lastAssistantSig = Object.create(null);
+
+function messageVariantSig(msg) {
+    if (!msg || typeof msg !== 'object') return null;
+    if (msg.content === undefined && msg.swipeId === undefined && msg.alternativeIndex === undefined) {
+        return null;
+    }
+    return `${msg.swipeId ?? msg.alternativeIndex ?? ''}:${msg.content ?? ''}`;
+}
 
 async function loadStateWithDefaults() {
     const raw = await tavo.variable.get(CHAT_VAR_KEY);
@@ -24,6 +33,10 @@ tavo.plugin.onInputAction('ask-codex', async () => {
 
 tavo.plugin.onSidebarAction('open-studio', async () => {
     tavo.plugin.emit('clodex-command', { action: 'open-tracker' });
+});
+
+tavo.plugin.onSidebarAction('open-cradle', async () => {
+    tavo.plugin.emit('clodex-command', { action: 'open-cradle' });
 });
 
 tavo.plugin.onSidebarAction('open-forge', async () => {
@@ -78,14 +91,35 @@ tavo.plugin.on('generation:prepare', async event => {
 
 tavo.plugin.on('message:added', async event => {
     if (event.message?.role !== 'assistant') return;
+    const id = String(event.message.id ?? '');
+    const sig = messageVariantSig(event.message);
+    if (id && sig !== null) lastAssistantSig[id] = sig;
     tavo.plugin.emit('clodex-assistant-turn', {
-        messageId: String(event.message.id ?? ''),
+        messageId: id,
     });
+});
+
+tavo.plugin.on('message:updated', async event => {
+    const msg = event?.message;
+    if (msg?.role && msg.role !== 'assistant') return;
+    const id = String(msg?.id ?? event?.messageId ?? '');
+    if (!id) return;
+    const nextSig = messageVariantSig(msg);
+    if (nextSig !== null && Object.prototype.hasOwnProperty.call(lastAssistantSig, id) && lastAssistantSig[id] === nextSig) {
+        return;
+    }
+    if (nextSig !== null) lastAssistantSig[id] = nextSig;
+    const state = await loadStateWithDefaults();
+    if (restoreCheckpointBefore(state, id)) {
+        await tavo.variable.set(CHAT_VAR_KEY, state);
+        tavo.plugin.emit('clodex-state-updated', { messageId: id });
+    }
 });
 
 tavo.plugin.on('message:deleted', async event => {
     const id = String(event.message?.id ?? '');
     if (!id) return;
+    delete lastAssistantSig[id];
     const state = await loadStateWithDefaults();
     if (restoreCheckpointBefore(state, id)) {
         await tavo.variable.set(CHAT_VAR_KEY, state);
@@ -94,5 +128,6 @@ tavo.plugin.on('message:deleted', async event => {
 });
 
 tavo.plugin.on('chat:opened', async () => {
+    lastAssistantSig = Object.create(null);
     tavo.plugin.emit('clodex-state-updated', {});
 });

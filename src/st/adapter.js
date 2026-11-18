@@ -1,10 +1,16 @@
-import { blobToBase64, validateKey } from '../core/api.js';
+import { base64ToBlob, blobToBase64, validateKey } from '../core/api.js';
 import { createRpStudioController } from '../core/hud.js';
 import { createChatState, normalizeChatState, restoreCheckpointBefore } from '../core/physiology.js';
 import { buildSystemContext } from '../core/prompts.js';
 
 export const ST_SETTINGS_KEY = 'clodex_rp_studio';
 export const ST_PROMPT_KEY = 'clodex_rp_studio_context';
+
+function normalizeMaxAutoSpend(val) {
+    if (val === undefined || val === null || val === '') return 0.25;
+    const num = Number(val);
+    return Number.isFinite(num) && num >= 0 ? num : 0.25;
+}
 
 export const DEFAULT_ST_SETTINGS = Object.freeze({
     apiKey: '',
@@ -20,6 +26,7 @@ export const DEFAULT_ST_SETTINGS = Object.freeze({
     autoTrack: true,
     injectContext: true,
     confirmPaid: true,
+    maxAutoSpendUsd: 0.25,
     autoImageEvery: 0,
     bgDim: 35,
     hudPos: null,
@@ -41,6 +48,7 @@ export function loadStSettings(context) {
         autoTrack: raw.autoTrack !== false,
         injectContext: raw.injectContext !== false,
         confirmPaid: raw.confirmPaid !== false,
+        maxAutoSpendUsd: normalizeMaxAutoSpend(raw.maxAutoSpendUsd),
         autoImageEvery: Math.max(0, Math.min(30, Number(raw.autoImageEvery) || 0)),
         bgDim: Math.max(0, Math.min(80, Number(raw.bgDim ?? 35))),
         hudPos: raw.hudPos && Number.isFinite(raw.hudPos.x) && Number.isFinite(raw.hudPos.y)
@@ -55,9 +63,9 @@ export function loadStSettings(context) {
     return clean;
 }
 
-async function uploadMediaToSt(context, fetchImpl, blob, ext) {
+async function uploadMediaToSt(context, fetchImpl, blob, ext, prefix = 'clodex-rp') {
     const base64 = await blobToBase64(blob);
-    const name = `clodex-rp-${Date.now()}.${ext}`;
+    const name = `${prefix}-${Date.now()}.${ext}`;
     try {
         const headers = new Headers(context.getRequestHeaders?.() ?? {});
         headers.set('Content-Type', 'application/json');
@@ -189,6 +197,8 @@ export async function initializeSillyTavern({
             for (const [k, v] of Object.entries(patch)) {
                 if (k === 'apiKey') {
                     settings.apiKey = v ? validateKey(v) : '';
+                } else if (k === 'maxAutoSpendUsd') {
+                    settings.maxAutoSpendUsd = normalizeMaxAutoSpend(v);
                 } else if (k in settings) {
                     settings[k] = v;
                 }
@@ -250,13 +260,24 @@ export async function initializeSillyTavern({
         },
         async loadCurrentSceneImageDataUrl(path) {
             if (!path) return '';
+            if (/^data:image\//i.test(path)) return path;
             const res = await fetchImpl(path, { credentials: 'same-origin' });
             if (!res.ok) return '';
             const blob = await res.blob();
             return `data:${blob.type || 'image/png'};base64,${await blobToBase64(blob)}`;
         },
-        async saveSpeechAudio({ blob }) {
-            return await uploadMediaToSt(getContext(), fetchImpl, blob, 'mp3');
+        async saveSpeechAudio({ blob, base64 }) {
+            const mediaBlob = blob || (base64 ? base64ToBlob(base64, 'audio/mpeg') : null);
+            if (!mediaBlob) throw new Error('Speech audio payload is empty.');
+            return await uploadMediaToSt(getContext(), fetchImpl, mediaBlob, 'mp3');
+        },
+        async saveCompanionMedia({ companionId, kind = 'image', blob, base64 } = {}) {
+            const safeId = String(companionId || 'main').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'main';
+            const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : 'png';
+            const mime = kind === 'video' ? 'video/mp4' : kind === 'audio' ? 'audio/mpeg' : 'image/png';
+            const mediaBlob = blob || (base64 ? base64ToBlob(base64, mime) : null);
+            if (!mediaBlob) throw new Error('Companion media payload is empty.');
+            return await uploadMediaToSt(getContext(), fetchImpl, mediaBlob, ext, `clodex-comp-${safeId}`);
         },
         playAudioPreview(path) {
             if (!path || typeof Audio !== 'function') return;
@@ -356,6 +377,7 @@ export async function initializeSillyTavern({
     // Register convenient slash commands if supported
     if (typeof context.registerSlashCommand === 'function') {
         context.registerSlashCommand('clodex-rp', () => controller.openTab('tracker'), [], 'Open CLODEx RP Studio Tracker', true, true);
+        context.registerSlashCommand('clodex-cradle', () => controller.openTab('cradle'), [], 'Open CLODEx Cradle & Familiar', true, true);
         context.registerSlashCommand('clodex-codex', () => controller.openTab('codex'), [], 'Open CLODEx Lore Codex', true, true);
         context.registerSlashCommand('clodex-scene', () => controller.openTab('scene'), [], 'Open CLODEx Scene & Voice', true, true);
         context.registerSlashCommand('clodex-forge', () => controller.openTab('forge'), [], 'Open CLODEx Character & Lorebook Forge', true, true);
