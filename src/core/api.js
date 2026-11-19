@@ -25,9 +25,30 @@ export function validateKey(key) {
     return value;
 }
 
+export function normalizeBaseUrl(rawUrl) {
+    const clean = String(rawUrl ?? '').trim();
+    if (!clean) return ORIGIN;
+    try {
+        const parsed = new URL(clean);
+        if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+            return ORIGIN;
+        }
+        return clean
+            .replace(/\/+$/, '')
+            .replace(/\/(v1\/chat\/completions|v1\/images\/generations|v1\/models|v1|v1beta)$/i, '');
+    } catch {
+        return ORIGIN;
+    }
+}
+
+export function isNativeGoogleBaseUrl(rawUrl) {
+    const clean = String(rawUrl ?? '').trim().toLowerCase();
+    return clean.includes('/google-ai') || clean.includes('generativelanguage.googleapis.com') || clean.endsWith('/v1beta');
+}
+
 export function taskId(value) {
     const id = String(value ?? '');
-    if (!/^[a-z\d_-]{1,200}$/i.test(id)) {
+    if (!/^[a-z\d_:-]{1,200}$/i.test(id)) {
         throw new ApiError('Invalid video task ID.', { code: 'invalid_response' });
     }
     return id;
@@ -116,18 +137,150 @@ export function base64ToBlob(base64, mimeType = 'image/png') {
     return new Blob([bytes], { type: mimeType });
 }
 
-function normalizeEndpointUrl(baseUrl, path) {
-    const rawBase = String(baseUrl || ORIGIN).trim().replace(/\/+$/, '') || ORIGIN;
-    // Strip trailing /v1 if the path already starts with /v1/
-    const cleanBase = rawBase.replace(/\/v1$/i, '');
-    return `${cleanBase}${path}`;
+function parseImageString(str) {
+    const text = String(str ?? '').trim();
+    if (!text) return null;
+
+    const dataUriMatch = text.match(/data:image\/[a-zA-Z0-9.+-]+;base64,([A-Za-z0-9+/=\r\n]+)/i);
+    if (dataUriMatch?.[1]) {
+        return { b64_json: dataUriMatch[1].replace(/[\r\n\s]+/g, '') };
+    }
+
+    const mdUrlMatch = text.match(/!\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/i);
+    if (mdUrlMatch?.[1]) {
+        return { url: mdUrlMatch[1] };
+    }
+
+    if (/^https?:\/\/\S+$/i.test(text)) {
+        return { url: text };
+    }
+
+    const compact = text.replace(/[\r\n\s]+/g, '');
+    if (compact.length > 256 && /^[A-Za-z0-9+/]+=*$/.test(compact)) {
+        return { b64_json: compact };
+    }
+
+    return null;
+}
+
+export function extractImageResult(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+
+    // 1. Standard OpenAI Images format: data: [{ b64_json, url, b64, base64, image }]
+    const list = Array.isArray(payload.data) ? payload.data
+        : Array.isArray(payload.images) ? payload.images
+            : Array.isArray(payload.output) ? payload.output : [];
+    for (const item of list) {
+        if (!item) continue;
+        if (typeof item === 'string') {
+            const parsed = parseImageString(item);
+            if (parsed) return parsed;
+        }
+        const b64 = item.b64_json || item.b64 || item.base64 || item.bytesBase64Encoded || item.image_base64
+            || item.inlineData?.data || item.inline_data?.data;
+        if (typeof b64 === 'string' && b64.trim()) {
+            const parsed = parseImageString(b64) || { b64_json: b64.replace(/^data:[^;]+;base64,/, '').trim() };
+            return parsed;
+        }
+        const url = item.url || item.image_url?.url || (typeof item.image_url === 'string' ? item.image_url : '') || item.uri;
+        if (typeof url === 'string' && url.trim()) {
+            const parsed = parseImageString(url) || { url: url.trim() };
+            return parsed;
+        }
+    }
+
+    // 2. Direct top-level fields
+    const directB64 = payload.b64_json || payload.base64 || payload.image_base64 || payload.image;
+    if (typeof directB64 === 'string' && directB64.trim()) {
+        const parsed = parseImageString(directB64);
+        if (parsed) return parsed;
+    }
+    if (typeof payload.url === 'string' && payload.url.trim()) {
+        const parsed = parseImageString(payload.url);
+        if (parsed) return parsed;
+    }
+
+    // 3. Google Vertex / Imagen predictions: predictions: [{ bytesBase64Encoded, mimeType }]
+    if (Array.isArray(payload.predictions)) {
+        for (const pred of payload.predictions) {
+            const b64 = pred?.bytesBase64Encoded || pred?.b64_json || pred?.base64 || pred?.image;
+            if (typeof b64 === 'string' && b64.trim()) {
+                return { b64_json: b64.replace(/^data:[^;]+;base64,/, '').trim() };
+            }
+        }
+    }
+
+    // 4. Google Gemini native generateContent: candidates[0].content.parts[{ inlineData: { data } }]
+    const candidates = Array.isArray(payload.candidates) ? payload.candidates : [];
+    for (const cand of candidates) {
+        const parts = Array.isArray(cand?.content?.parts) ? cand.content.parts : [];
+        for (const part of parts) {
+            const inline = part?.inlineData?.data || part?.inline_data?.data;
+            if (typeof inline === 'string' && inline.trim()) {
+                return { b64_json: inline.replace(/^data:[^;]+;base64,/, '').trim() };
+            }
+            const fileUri = part?.fileData?.fileUri || part?.file_data?.file_uri;
+            if (typeof fileUri === 'string' && fileUri.trim()) {
+                const parsed = parseImageString(fileUri);
+                if (parsed) return parsed;
+            }
+            if (typeof part?.text === 'string' && part.text.trim()) {
+                const parsed = parseImageString(part.text);
+                if (parsed) return parsed;
+            }
+        }
+    }
+
+    // 5. OpenAI Chat Completions multimodal response (OpenRouter / LiteLLM / Proxy Gemini Image)
+    const choices = Array.isArray(payload.choices) ? payload.choices : [];
+    for (const choice of choices) {
+        const msg = choice?.message || choice?.delta || {};
+        if (Array.isArray(msg.images)) {
+            for (const img of msg.images) {
+                if (typeof img === 'string') {
+                    const parsed = parseImageString(img);
+                    if (parsed) return parsed;
+                }
+                const b64 = img?.b64_json || img?.base64 || img?.data || img?.inlineData?.data || img?.inline_data?.data;
+                if (typeof b64 === 'string' && b64.trim()) {
+                    return parseImageString(b64) || { b64_json: b64.replace(/^data:[^;]+;base64,/, '').trim() };
+                }
+                const url = img?.image_url?.url || (typeof img?.image_url === 'string' ? img.image_url : '') || img?.url;
+                if (typeof url === 'string' && url.trim()) {
+                    return parseImageString(url) || { url: url.trim() };
+                }
+            }
+        }
+        const content = msg.content;
+        if (Array.isArray(content)) {
+            for (const part of content) {
+                const b64 = part?.b64_json || part?.base64 || part?.data || part?.inlineData?.data || part?.inline_data?.data;
+                if (typeof b64 === 'string' && b64.trim()) {
+                    return parseImageString(b64) || { b64_json: b64.replace(/^data:[^;]+;base64,/, '').trim() };
+                }
+                const url = part?.image_url?.url || (typeof part?.image_url === 'string' ? part.image_url : '') || part?.url;
+                if (typeof url === 'string' && url.trim()) {
+                    return parseImageString(url) || { url: url.trim() };
+                }
+                if (typeof part?.text === 'string') {
+                    const parsed = parseImageString(part.text);
+                    if (parsed) return parsed;
+                }
+            }
+        } else if (typeof content === 'string' && content.trim()) {
+            const parsed = parseImageString(content);
+            if (parsed) return parsed;
+        }
+    }
+
+    return null;
 }
 
 export class ClodexApi {
     constructor({
         getKey,
         getBaseUrl,
-        chatHandler,
+        chatHandler = null,
         fetchImpl = globalThis.fetch?.bind(globalThis),
         sleep = abortableDelay,
         now = Date.now,
@@ -140,15 +293,23 @@ export class ClodexApi {
         this.now = now;
     }
 
+    resolveOrigin() {
+        return normalizeBaseUrl(this.getBaseUrl?.());
+    }
+
     async request(path, { method = 'GET', body, auth = true, signal, timeout = 60_000, blob = false } = {}) {
-        if (!/^\/(v1\/|api\/(usage\/token\/|status$|pricing$))/.test(path)
-            || path.includes('..') || path.includes('\\') || path.includes('#')) {
+        if (!path.startsWith('/') || path.includes('..') || path.includes('\\') || path.includes('#')) {
             throw new ApiError('Invalid API path.', { code: 'invalid_path' });
         }
         const rawKey = String(this.getKey?.() ?? '').trim();
         const key = auth ? validateKey(rawKey) : rawKey;
         const headers = new Headers();
-        if (key) headers.set('Authorization', `Bearer ${key}`);
+        if (key) {
+            headers.set('Authorization', `Bearer ${key}`);
+            if (path.startsWith('/v1beta/') || isNativeGoogleBaseUrl(this.getBaseUrl?.())) {
+                headers.set('x-goog-api-key', key);
+            }
+        }
         if (body !== undefined) headers.set('Content-Type', 'application/json');
 
         const controller = new AbortController();
@@ -157,10 +318,10 @@ export class ClodexApi {
         signal?.addEventListener('abort', onAbort, { once: true });
         const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeout);
 
-        const targetUrl = normalizeEndpointUrl(this.getBaseUrl?.(), path);
+        const baseUrl = this.resolveOrigin();
 
         try {
-            const response = await this.fetch(targetUrl, {
+            const response = await this.fetch(`${baseUrl}${path}`, {
                 method,
                 headers,
                 body: body === undefined ? undefined : JSON.stringify(body),
@@ -185,14 +346,30 @@ export class ClodexApi {
         } catch (error) {
             if (controller.signal.aborted) throw controller.signal.reason;
             if (error instanceof ApiError) throw error;
-            throw new ApiError('Network/CORS error. Check Image API URL and key.', { code: 'network_error' });
+            throw new ApiError(`Network/CORS error connecting to ${baseUrl}.`, { code: 'network_error' });
         } finally {
             clearTimeout(timer);
             signal?.removeEventListener('abort', onAbort);
         }
     }
 
-    models(signal) {
+    async models(signal) {
+        const rawBase = String(this.getBaseUrl?.() ?? '');
+        if (isNativeGoogleBaseUrl(rawBase)) {
+            try {
+                const googleData = await this.request('/v1beta/models', { signal });
+                if (Array.isArray(googleData?.models)) {
+                    return {
+                        data: googleData.models.map(m => ({
+                            id: String(m.name || '').replace(/^models\//, ''),
+                            object: 'model',
+                        })).filter(m => m.id),
+                    };
+                }
+            } catch {
+                // fallback to /v1/models
+            }
+        }
         return this.request('/v1/models', { signal });
     }
 
@@ -227,13 +404,23 @@ export class ClodexApi {
         });
     }
 
-    async chat({ model, messages, temperature = 0.25, maxTokens = 600, jsonMode = false }, signal) {
+    async chat({ model, messages, temperature = 0.25, maxTokens = 600, jsonMode = false, profileId = '' }, signal) {
         if (typeof this.chatHandler === 'function') {
-            const text = await this.chatHandler({ model, messages, temperature, maxTokens, jsonMode, signal });
+            signal?.throwIfAborted();
+            const text = await this.chatHandler({
+                model,
+                profileId: profileId || model,
+                messages,
+                temperature,
+                maxTokens,
+                jsonMode,
+                signal,
+            });
             const clean = String(text ?? '').trim();
-            if (!clean) throw new ApiError('Empty model response from SillyTavern profile.', { code: 'empty_response' });
+            if (!clean) throw new ApiError('Empty model response from SillyTavern API.', { code: 'empty_response' });
             return clean;
         }
+
         if (!model) throw new ApiError('Select a text model first.', { code: 'model_required' });
         const body = {
             model,
@@ -263,16 +450,79 @@ export class ClodexApi {
     }
 
     async image({ model, prompt, size = '', quality = '' }, signal) {
-        if (!model) throw new ApiError('Enter or select an image model first.', { code: 'model_required' });
-        const body = { model, prompt, n: 1 };
-        if (size) body.size = size;
-        if (quality) body.quality = quality;
-        const data = await this.request('/v1/images/generations', { method: 'POST', body, signal, timeout: 180_000 });
-        const result = data.data?.[0];
-        if (!result?.b64_json && !result?.url) {
-            throw new ApiError('Image response contains no image.', { code: 'invalid_response' });
+        const cleanModel = String(model ?? '').trim().replace(/^models\//, '');
+        if (!cleanModel) throw new ApiError('Select an image model first.', { code: 'model_required' });
+
+        const rawBase = String(this.getBaseUrl?.() ?? '');
+        const isGoogleNative = isNativeGoogleBaseUrl(rawBase);
+        const isGeminiLike = /gemini|banana|flash|imagen/i.test(cleanModel);
+
+        const tryOpenAiImages = async () => {
+            const body = { model: cleanModel, prompt, n: 1 };
+            if (size) body.size = size;
+            if (quality) body.quality = quality;
+            const data = await this.request('/v1/images/generations', {
+                method: 'POST',
+                body,
+                signal,
+                timeout: 180_000,
+            });
+            return extractImageResult(data);
+        };
+
+        const tryGoogleGenerateContent = async () => {
+            const body = {
+                contents: [{ role: 'user', parts: [{ text: String(prompt ?? '') }] }],
+                generationConfig: {
+                    responseModalities: ['TEXT', 'IMAGE'],
+                },
+            };
+            const data = await this.request(`/v1beta/models/${encodeURIComponent(cleanModel)}:generateContent`, {
+                method: 'POST',
+                body,
+                signal,
+                timeout: 180_000,
+            });
+            return extractImageResult(data);
+        };
+
+        const tryOpenAiChatImage = async () => {
+            const body = {
+                model: cleanModel,
+                messages: [{ role: 'user', content: String(prompt ?? '') }],
+                modalities: ['text', 'image'],
+                stream: false,
+            };
+            const data = await this.request('/v1/chat/completions', {
+                method: 'POST',
+                body,
+                signal,
+                timeout: 180_000,
+            });
+            return extractImageResult(data);
+        };
+
+        const strategies = isGoogleNative
+            ? [tryGoogleGenerateContent, tryOpenAiImages, tryOpenAiChatImage]
+            : isGeminiLike
+                ? [tryOpenAiImages, tryOpenAiChatImage, tryGoogleGenerateContent]
+                : [tryOpenAiImages, tryOpenAiChatImage];
+
+        let lastError = null;
+        for (const attempt of strategies) {
+            try {
+                const res = await attempt();
+                if (res && (res.b64_json || res.url)) {
+                    return res;
+                }
+            } catch (err) {
+                if (signal?.aborted) throw err;
+                lastError = err;
+            }
         }
-        return result;
+
+        if (lastError) throw lastError;
+        throw new ApiError('Image response contains no image.', { code: 'invalid_response' });
     }
 
     async downloadImage(url, signal) {
