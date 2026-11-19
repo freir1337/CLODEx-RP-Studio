@@ -323,6 +323,7 @@
   "clodex_rp.notice.autoSpendCapReached": "FinOps shield paused auto-generation: session auto-spend ({spent}) reached limit ({cap}).",
   "clodex_rp.confirm.paidMedia": "Run paid CLODEx {kind} generation using model \"{model}\"?",
   "clodex_rp.releaseNotes.1_3_0": "v1.3.0 «Director & Living World»: one-turn Director strip above the input (suspense, twist, dialogue focus, slow pacing, NPC point of view, sensory details + your own 140-char note), local Anti-Slop radar in Codex → Style, hidden thoughts and 3 suggested actions under the last reply, Smartphone / Diary & World Feed with click-to-reveal photos and voice notes, Living Session Wiki (NPCs, quests, places, timeline) with pinned manual edits, branch-safe journals for swipes, and shareable data-only .clodex-pack presets. Zero extra API calls per turn; the role-play prompt addition stays under 250 tokens.",
+  "clodex_rp.releaseNotes.1_3_1": "v1.3.1 mobile Tavo WebView hotfix: fixed the drawer mask overriding the HTML [hidden] attribute (which dimmed and blocked the chat on load and prevented the ✕ close button from dismissing the drawer), removed the stray \"null\" text rendered below drawer tabs when no error banner is active, and aligned the collapsed Director pill to the right so it does not overlap Tavo bottom input buttons.",
   "clodex_rp.actions.openPhone": "Open Smartphone / Diary",
   "clodex_rp.settings.header.v13": "Director & Living World (v1.3)",
   "clodex_rp.settings.slopMode.label": "Anti-Slop radar mode",

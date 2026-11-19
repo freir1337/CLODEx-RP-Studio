@@ -315,6 +315,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
     function clear() {
         mount.replaceChildren();
         mount.hidden = true;
+        if (mount.style) mount.style.display = 'none';
     }
 
     async function render() {
@@ -371,6 +372,7 @@ function tavoFirstCheckpointKeyForMessage(state, messageId) {
         }
         mount.replaceChildren(node('div', { className: 'clodex-rp-turn' }, ...blocks));
         mount.hidden = false;
+        if (mount.style) mount.style.display = '';
     }
 
     const rerender = () => {

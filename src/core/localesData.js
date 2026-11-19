@@ -350,6 +350,7 @@ export const EN_CATALOG = Object.freeze({
     'confirm.paidMedia': 'Run paid CLODEx {kind} generation using model "{model}"?',
     // v1.3.0 «Director & Living World»
     'releaseNotes.1_3_0': 'v1.3.0 «Director & Living World»: one-turn Director strip above the input (suspense, twist, dialogue focus, slow pacing, NPC point of view, sensory details + your own 140-char note), local Anti-Slop radar in Codex → Style, hidden thoughts and 3 suggested actions under the last reply, Smartphone / Diary & World Feed with click-to-reveal photos and voice notes, Living Session Wiki (NPCs, quests, places, timeline) with pinned manual edits, branch-safe journals for swipes, and shareable data-only .clodex-pack presets. Zero extra API calls per turn; the role-play prompt addition stays under 250 tokens.',
+    'releaseNotes.1_3_1': 'v1.3.1 mobile Tavo WebView hotfix: fixed the drawer mask overriding the HTML [hidden] attribute (which dimmed and blocked the chat on load and prevented the ✕ close button from dismissing the drawer), removed the stray "null" text rendered below drawer tabs when no error banner is active, and aligned the collapsed Director pill to the right so it does not overlap Tavo bottom input buttons.',
     'actions.openPhone': 'Open Smartphone / Diary',
     'settings.header.v13': 'Director & Living World (v1.3)',
     'settings.slopMode.label': 'Anti-Slop radar mode',
@@ -874,6 +875,7 @@ export const RU_CATALOG = Object.freeze({
     'confirm.paidMedia': 'Запустить платную генерацию ({kind}) в CLODEx на модели «{model}»?',
     // v1.3.0 «Режиссёр и Живой мир»
     'releaseNotes.1_3_0': 'v1.3.0 «Режиссёр и Живой мир»: полоска режиссёра над полем ввода на один ход (саспенс, внезапный поворот, фокус на диалоге, замедление темпа, взгляд NPC, чувственные детали и своя заметка до 140 символов), локальный радар штампов в «Кодекс → Стиль», скрытые мысли и 3 варианта действий под последним ответом, Смартфон / Дневник и Лента мира с фото и голосовыми по клику, Живая вики сессии (NPC, квесты, места, таймлайн) с закреплёнными ручными правками, журналы, устойчивые к свайпам, и пресеты .clodex-pack только с данными. Ноль дополнительных запросов на ход, добавка к промпту ролевой модели — не больше 250 токенов.',
+    'releaseNotes.1_3_1': 'v1.3.1 срочный фикс для мобильного Tavo AI: исправлен CSS-конфликт маски панели с атрибутом [hidden], из-за которого при запуске экран чата затемнялся и переставал нажиматься, а кнопка ✕ не закрывала панель; убран лишний текст «null» под вкладками при отсутствии ошибок; свёрнутая кнопка «🎬 Режиссёр» смещена вправо, чтобы не перекрывать кнопки над полем ввода.',
     'actions.openPhone': 'Открыть смартфон / дневник',
     'settings.header.v13': 'Режиссёр и Живой мир (v1.3)',
     'settings.slopMode.label': 'Режим радара штампов',

@@ -90,6 +90,7 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
     function clear() {
         mount.replaceChildren();
         mount.hidden = true;
+        if (mount.style) mount.style.display = 'none';
     }
 
     async function render() {
@@ -146,6 +147,7 @@ import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
         }
         mount.replaceChildren(node('div', { className: 'clodex-rp-turn' }, ...blocks));
         mount.hidden = false;
+        if (mount.style) mount.style.display = '';
     }
 
     const rerender = () => {

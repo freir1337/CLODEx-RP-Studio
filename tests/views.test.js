@@ -67,7 +67,11 @@ function makeFakeDom() {
             return this.childNodes.map(c => c.textContent ?? '').join('');
         }
         set textContent(v) {
-            this.replaceChildren(v === '' || v === null || v === undefined ? null : this.ownerDocument.createTextNode(String(v)));
+            if (v === '' || v === null || v === undefined) {
+                this.replaceChildren();
+            } else {
+                this.replaceChildren(this.ownerDocument.createTextNode(String(v)));
+            }
         }
         set innerHTML(_v) {
             throw new Error('innerHTML is forbidden in views');
@@ -121,10 +125,11 @@ function makeFakeDom() {
         _adopt(nodes) {
             const out = [];
             for (const n of nodes.flat()) {
-                if (n === null || n === undefined || n === false) continue;
-                const node = typeof n === 'string' || typeof n === 'number'
-                    ? this.ownerDocument.createTextNode(String(n))
-                    : n;
+                // Match the real DOM Living Standard: Element.append/replaceChildren convert
+                // null/undefined/false into text nodes ("null"/"undefined"/"false") instead of skipping them.
+                const node = n && typeof n === 'object' && typeof n.nodeType === 'number'
+                    ? n
+                    : this.ownerDocument.createTextNode(String(n));
                 if (node.parentNode && node.parentNode !== this) {
                     const idx = node.parentNode.childNodes.indexOf(node);
                     if (idx >= 0) node.parentNode.childNodes.splice(idx, 1);
@@ -711,4 +716,56 @@ test('syncTrackerFromChat gates phoneEvents via phoneShouldInclude, escapes LLM 
     }
 
     high.controller.dispose();
+});
+
+test('Mobile Tavo hotfix: drawer mask starts hidden/non-blocking, X closes cleanly, and no "null" text renders', async () => {
+    const css = await readFile(new URL('../style.css', import.meta.url), 'utf8');
+    assert.match(css, /\.clodex-rp-drawer-mask\[hidden\][\s\S]*?display:\s*none\s*!important/);
+    assert.match(css, /\.clodex-rp-drawer-mask\s*\{[\s\S]*?display:\s*none;/);
+    assert.match(css, /\.clodex-rp-drawer-mask\.is-open:not\(\[hidden\]\)\s*\{[\s\S]*?display:\s*flex;/);
+
+    const h = makeTestHarness({ locale: 'ru' });
+    await flush();
+
+    const mask = h.doc.body.querySelector('.clodex-rp-drawer-mask');
+    const drawer = h.doc.body.querySelector('.clodex-rp-drawer');
+    const videoBg = h.doc.body.querySelector('.clodex-rp-video-backdrop');
+
+    // Initial state must never dim or block the chat in WebViews without a [hidden] CSS reset
+    assert.equal(mask.hidden, true);
+    assert.equal(mask.style.display, 'none');
+    assert.equal(mask.style.pointerEvents, 'none');
+    assert.ok(!mask.className.includes('is-open'));
+    assert.equal(videoBg.hidden, true);
+    assert.equal(videoBg.style.display, 'none');
+
+    // Opening via openTab renders cleanly without stray "null" text nodes
+    h.controller.openTab('codex');
+    await flush();
+    assert.equal(mask.hidden, false);
+    assert.equal(mask.style.display, 'flex');
+    assert.equal(mask.style.pointerEvents, 'auto');
+    assert.ok(mask.className.includes('is-open'));
+    assert.ok(!drawer.textContent.includes('null'), `Stray "null" rendered in drawer: ${drawer.textContent}`);
+
+    // Clicking the ✕ button hides the mask, disables pointer events, and clears panel contents
+    const closeBtn = drawer.querySelector('[data-rp-action="close-drawer"]');
+    assert.ok(closeBtn);
+    closeBtn.click();
+    assert.equal(mask.hidden, true);
+    assert.equal(mask.style.display, 'none');
+    assert.equal(mask.style.pointerEvents, 'none');
+    assert.ok(!mask.className.includes('is-open'));
+    assert.equal(drawer.childNodes.length, 0);
+
+    // Clicking the HUD pill opens the drawer, and tapping the mask outside closes it
+    const pill = h.doc.body.querySelector('.clodex-rp-hud-pill');
+    pill.click();
+    assert.equal(mask.hidden, false);
+    assert.equal(mask.style.display, 'flex');
+    mask.click();
+    assert.equal(mask.hidden, true);
+    assert.equal(mask.style.display, 'none');
+
+    h.controller.dispose();
 });

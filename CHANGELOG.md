@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.1 — 2026-11-19
+
+- **Mobile Tavo AI WebView Hotfix**:
+  - Fixed `.clodex-rp-drawer-mask` (`display: flex`) overriding the HTML `[hidden]` attribute in WebViews without a `[hidden] { display: none !important; }` reset — which previously left a dark dimming veil (`rgba(5, 7, 12, 0.62)`) over the entire chat on startup, blocked taps on the chat/HUD, and prevented the `✕` close button and backdrop tap from closing the drawer. Added explicit `[hidden]` CSS rules, `.is-open` gating, inline `display`/`pointer-events` sync, and DOM cleanup when closing.
+  - Fixed a literal `"null"` text node appearing under the drawer tabs when no error banner was active (caused by passing `null` to native `Element.prototype.replaceChildren`).
+  - Right-aligned the collapsed `🎬 Director` pill so it sits cleanly in the open bottom-right space instead of overlapping Tavo's left-aligned input action buttons on mobile screens; added a `click` fallback on the HUD pill and `Escape` key dismissal.
+
 ## 1.3.0 — 2026-11-19
 
 - **Director & Living World («Режиссёр и Живой мир»)** — adds seven tightly budgeted living-world modules with **0 extra API calls per turn** (aside from the optional periodic wiki refresh) and a strict **≤ 250-token** prompt cap enforced by `ctxPack`:

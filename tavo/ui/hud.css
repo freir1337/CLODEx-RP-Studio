@@ -10,6 +10,14 @@
     --clodex-rp-danger: #ef4444;
 }
 
+.clodex-rp-root [hidden],
+.clodex-rp-drawer-mask[hidden],
+.clodex-rp-video-backdrop[hidden],
+.clodex-rp-turn-host[hidden] {
+    display: none !important;
+    pointer-events: none !important;
+}
+
 .clodex-rp-video-backdrop {
     position: fixed;
     inset: 0;
@@ -108,10 +116,16 @@
     right: 0;
     z-index: 9995;
     background: rgba(5, 7, 12, 0.62);
-    display: flex;
+    display: none;
+    pointer-events: none;
     justify-content: center;
     align-items: flex-start;
     padding: 10px;
+}
+
+.clodex-rp-drawer-mask.is-open:not([hidden]) {
+    display: flex;
+    pointer-events: auto;
 }
 
 .clodex-rp-drawer {
@@ -154,6 +168,14 @@
     align-items: center;
     gap: 5px;
     flex-shrink: 0;
+}
+
+.clodex-rp-head-actions .clodex-rp-btn-mini {
+    min-width: 30px;
+    min-height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
 }
 
 .clodex-rp-tabs {
@@ -626,7 +648,7 @@
     z-index: 9989;
     pointer-events: none;
     display: flex;
-    justify-content: center;
+    justify-content: flex-end;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
 }
 

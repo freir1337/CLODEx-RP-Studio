@@ -149,6 +149,7 @@ export function createRpStudioController(bridge) {
 
     const hostRoot = el(doc, 'div', { className: 'clodex-rp-root' });
     const backdropEl = el(doc, 'div', { className: 'clodex-rp-video-backdrop', hidden: true });
+    backdropEl.style.display = 'none';
     const backdropVideo = el(doc, 'video', {
         className: 'clodex-rp-video-el',
         autoplay: true,
@@ -170,6 +171,8 @@ export function createRpStudioController(bridge) {
             if (e.target === drawerBackdrop) toggleDrawer(false);
         },
     });
+    drawerBackdrop.style.display = 'none';
+    drawerBackdrop.style.pointerEvents = 'none';
     const drawerPanel = el(doc, 'section', { className: 'clodex-rp-drawer' });
     drawerBackdrop.append(drawerPanel);
     // M1 director strip: compact, collapsed by default, docked right above the chat composer
@@ -314,16 +317,24 @@ export function createRpStudioController(bridge) {
         applyPillPosition({ x: dragState.origLeft + dx, y: dragState.origTop + dy });
     });
 
+    let lastPointerHandledAt = 0;
+
     hudPill.addEventListener('pointerup', event => {
         if (!dragState || event.pointerId !== dragState.pointerId) return;
         const wasMoved = dragState.moved;
         const rect = hudPill.getBoundingClientRect();
         dragState = null;
+        lastPointerHandledAt = Date.now();
         if (wasMoved) {
             bridge.saveHudPosition?.({ x: Math.round(rect.left), y: Math.round(rect.top) });
         } else {
             toggleDrawer(!drawerOpen);
         }
+    });
+
+    hudPill.addEventListener('click', () => {
+        if (Date.now() - lastPointerHandledAt < 400) return;
+        toggleDrawer(!drawerOpen);
     });
 
     hudPill.addEventListener('pointercancel', () => {
@@ -333,10 +344,14 @@ export function createRpStudioController(bridge) {
     function toggleDrawer(open) {
         drawerOpen = Boolean(open);
         drawerBackdrop.hidden = !drawerOpen;
+        drawerBackdrop.className = drawerOpen ? 'clodex-rp-drawer-mask is-open' : 'clodex-rp-drawer-mask';
+        drawerBackdrop.style.display = drawerOpen ? 'flex' : 'none';
+        drawerBackdrop.style.pointerEvents = drawerOpen ? 'auto' : 'none';
         if (drawerOpen) {
             if (activeTab === 'scene') syncCachedCharName();
             renderDrawer();
         } else {
+            drawerPanel.replaceChildren();
             phoneHighlightIds.clear();
         }
     }
@@ -380,10 +395,12 @@ export function createRpStudioController(bridge) {
                 backdropVideo.play?.().catch(() => {});
             }
             backdropEl.hidden = false;
+            backdropEl.style.display = 'block';
         } else {
             backdropVideo.pause?.();
             backdropVideo.removeAttribute('src');
             backdropEl.hidden = true;
+            backdropEl.style.display = 'none';
         }
     }
 
@@ -3755,7 +3772,7 @@ export function createRpStudioController(bridge) {
         else body = renderTrackerTab(state);
 
         const unseen = Number(phoneCache.unseen) || 0;
-        drawerPanel.replaceChildren(
+        const drawerChildren = [
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
                 el(doc, 'strong', { className: 'clodex-rp-brand' }, t('plugin.name')),
                 el(doc, 'div', { className: 'clodex-rp-head-actions' },
@@ -3806,7 +3823,11 @@ export function createRpStudioController(bridge) {
                         className: 'clodex-rp-btn-mini',
                         title: t('drawer.close'),
                         'aria-label': t('drawer.close'),
-                        onClick: () => toggleDrawer(false),
+                        dataset: { rpAction: 'close-drawer' },
+                        onClick: e => {
+                            e?.stopPropagation?.();
+                            toggleDrawer(false);
+                        },
                     }, '✕'),
                 ),
             ),
@@ -3821,9 +3842,12 @@ export function createRpStudioController(bridge) {
                     },
                 }, label)),
             ),
-            errorBanner ? el(doc, 'div', { className: 'clodex-rp-error' }, errorBanner) : null,
-            body,
-        );
+        ];
+        if (errorBanner) {
+            drawerChildren.push(el(doc, 'div', { className: 'clodex-rp-error' }, errorBanner));
+        }
+        if (body) drawerChildren.push(body);
+        drawerPanel.replaceChildren(...drawerChildren);
     }
 
     function renderAll() {
@@ -3885,7 +3909,11 @@ export function createRpStudioController(bridge) {
         applyPillPosition(bridge.loadHudPosition?.());
         applyDirectorPosition();
     };
+    const onKeyDown = e => {
+        if (e?.key === 'Escape' && drawerOpen) toggleDrawer(false);
+    };
     win.addEventListener?.('resize', onResize);
+    win.addEventListener?.('keydown', onKeyDown);
 
     // Initial render & background catalog load if key already present
     renderAll();
@@ -3960,6 +3988,7 @@ export function createRpStudioController(bridge) {
             unsubLocale?.();
             unsubInsets?.();
             win.removeEventListener?.('resize', onResize);
+            win.removeEventListener?.('keydown', onKeyDown);
             hostRoot.remove();
         },
     };
