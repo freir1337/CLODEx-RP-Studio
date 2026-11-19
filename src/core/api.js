@@ -1,3 +1,4 @@
+// src/core/api.js
 export const ORIGIN = 'https://clodex.xyz';
 export const MAX_MEDIA_BYTES = 100 * 1024 * 1024;
 
@@ -18,8 +19,8 @@ export function redact(value, key = '') {
 
 export function validateKey(key) {
     const value = String(key ?? '').trim();
-    if (!/^sk-[a-z\d_-]{6,}$/i.test(value)) {
-        throw new ApiError('Enter a valid CLODEx sk-… API key.', { code: 'key_required' });
+    if (!value) {
+        throw new ApiError('Enter a valid API key.', { code: 'key_required' });
     }
     return value;
 }
@@ -34,10 +35,7 @@ export function taskId(value) {
 
 export function safeMediaUrl(value) {
     const url = new URL(String(value));
-    const host = url.hostname.toLowerCase();
-    if (url.protocol !== 'https:' || url.username || url.password || (url.port && url.port !== '443')
-        || host === 'localhost' || !host.includes('.') || host.endsWith('.localhost') || host.endsWith('.local')
-        || host.endsWith('.internal') || /^\d+\.\d+\.\d+\.\d+$/.test(host) || host.includes(':')) {
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
         throw new ApiError('Unsafe media URL rejected.', { code: 'unsafe_url' });
     }
     return url.href;
@@ -118,14 +116,25 @@ export function base64ToBlob(base64, mimeType = 'image/png') {
     return new Blob([bytes], { type: mimeType });
 }
 
+function normalizeEndpointUrl(baseUrl, path) {
+    const rawBase = String(baseUrl || ORIGIN).trim().replace(/\/+$/, '') || ORIGIN;
+    // Strip trailing /v1 if the path already starts with /v1/
+    const cleanBase = rawBase.replace(/\/v1$/i, '');
+    return `${cleanBase}${path}`;
+}
+
 export class ClodexApi {
     constructor({
         getKey,
+        getBaseUrl,
+        chatHandler,
         fetchImpl = globalThis.fetch?.bind(globalThis),
         sleep = abortableDelay,
         now = Date.now,
     } = {}) {
         this.getKey = getKey;
+        this.getBaseUrl = getBaseUrl;
+        this.chatHandler = chatHandler;
         this.fetch = fetchImpl;
         this.sleep = sleep;
         this.now = now;
@@ -136,7 +145,8 @@ export class ClodexApi {
             || path.includes('..') || path.includes('\\') || path.includes('#')) {
             throw new ApiError('Invalid API path.', { code: 'invalid_path' });
         }
-        const key = auth ? validateKey(this.getKey?.()) : '';
+        const rawKey = String(this.getKey?.() ?? '').trim();
+        const key = auth ? validateKey(rawKey) : rawKey;
         const headers = new Headers();
         if (key) headers.set('Authorization', `Bearer ${key}`);
         if (body !== undefined) headers.set('Content-Type', 'application/json');
@@ -147,13 +157,15 @@ export class ClodexApi {
         signal?.addEventListener('abort', onAbort, { once: true });
         const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'TimeoutError')), timeout);
 
+        const targetUrl = normalizeEndpointUrl(this.getBaseUrl?.(), path);
+
         try {
-            const response = await this.fetch(`${ORIGIN}${path}`, {
+            const response = await this.fetch(targetUrl, {
                 method,
                 headers,
                 body: body === undefined ? undefined : JSON.stringify(body),
                 credentials: 'omit',
-                redirect: 'error',
+                redirect: 'follow',
                 referrerPolicy: 'no-referrer',
                 signal: controller.signal,
             });
@@ -173,7 +185,7 @@ export class ClodexApi {
         } catch (error) {
             if (controller.signal.aborted) throw controller.signal.reason;
             if (error instanceof ApiError) throw error;
-            throw new ApiError('Network/CORS error. Check connection and CLODEx API availability.', { code: 'network_error' });
+            throw new ApiError('Network/CORS error. Check Image API URL and key.', { code: 'network_error' });
         } finally {
             clearTimeout(timer);
             signal?.removeEventListener('abort', onAbort);
@@ -197,13 +209,13 @@ export class ClodexApi {
     }
 
     voices(model, { search = '', page = 1, signal } = {}) {
-        if (!model) throw new ApiError('Select a CLODEx speech model first.', { code: 'model_required' });
+        if (!model) throw new ApiError('Select a speech model first.', { code: 'model_required' });
         const query = new URLSearchParams({ model, search, page: String(page), page_size: '100' });
         return this.request(`/v1/audio/voices?${query}`, { signal, timeout: 30_000 });
     }
 
     speech({ model, input, voice = 'alloy' }, signal) {
-        if (!model) throw new ApiError('Select a CLODEx speech model first.', { code: 'model_required' });
+        if (!model) throw new ApiError('Select a speech model first.', { code: 'model_required' });
         const text = String(input ?? '').trim();
         if (!text) throw new ApiError('Speech text is empty.', { code: 'empty_input' });
         return this.request('/v1/audio/speech', {
@@ -216,7 +228,13 @@ export class ClodexApi {
     }
 
     async chat({ model, messages, temperature = 0.25, maxTokens = 600, jsonMode = false }, signal) {
-        if (!model) throw new ApiError('Select a CLODEx text model first.', { code: 'model_required' });
+        if (typeof this.chatHandler === 'function') {
+            const text = await this.chatHandler({ model, messages, temperature, maxTokens, jsonMode, signal });
+            const clean = String(text ?? '').trim();
+            if (!clean) throw new ApiError('Empty model response from SillyTavern profile.', { code: 'empty_response' });
+            return clean;
+        }
+        if (!model) throw new ApiError('Select a text model first.', { code: 'model_required' });
         const body = {
             model,
             messages,
@@ -229,7 +247,6 @@ export class ClodexApi {
         try {
             data = await this.request('/v1/chat/completions', { method: 'POST', body, signal, timeout: 90_000 });
         } catch (err) {
-            // Some upstream models reject response_format: json_object; retry once without it.
             if (jsonMode && err instanceof ApiError && err.status >= 400 && err.status < 500) {
                 delete body.response_format;
                 data = await this.request('/v1/chat/completions', { method: 'POST', body, signal, timeout: 90_000 });
@@ -246,7 +263,7 @@ export class ClodexApi {
     }
 
     async image({ model, prompt, size = '', quality = '' }, signal) {
-        if (!model) throw new ApiError('Select a CLODEx image model first.', { code: 'model_required' });
+        if (!model) throw new ApiError('Enter or select an image model first.', { code: 'model_required' });
         const body = { model, prompt, n: 1 };
         if (size) body.size = size;
         if (quality) body.quality = quality;
@@ -282,7 +299,7 @@ export class ClodexApi {
     }
 
     async createVideo({ model, prompt, seconds = '', image }, signal) {
-        if (!model) throw new ApiError('Select a CLODEx video model first.', { code: 'model_required' });
+        if (!model) throw new ApiError('Select a video model first.', { code: 'model_required' });
         const body = { model, prompt };
         if (seconds) body.seconds = String(seconds);
         if (image) body.image = image;
