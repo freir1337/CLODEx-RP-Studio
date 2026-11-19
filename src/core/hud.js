@@ -1,3 +1,4 @@
+// src/core/hud.js
 import { base64ToBlob, blobToBase64, bytesToBase64, ClodexApi, redact, validateKey } from './api.js';
 import { normalizeCatalog, pickRecommendedModels, priceView, videoBillingView, walletView } from './catalog.js';
 import { buildCodexMessages, CODEX_PRESETS } from './codex.js';
@@ -142,8 +143,22 @@ export function createRpStudioController(bridge) {
     let packStatusText = '';
     let currentCharDescription = '';
 
+    const hasStChatBridge = () => typeof bridge.chatViaSt === 'function';
+    const getTrackerProfileOrModel = settings => (
+        hasStChatBridge()
+            ? (settings.stTextProfileId || '__st_active__')
+            : (settings.trackerModel || settings.codexModel)
+    );
+    const getCodexProfileOrModel = settings => (
+        hasStChatBridge()
+            ? (settings.stCodexProfileId || settings.stTextProfileId || '__st_active__')
+            : (settings.codexModel || settings.trackerModel)
+    );
+
     const api = new ClodexApi({
         getKey: () => bridge.getEffectiveKey(),
+        getBaseUrl: () => bridge.getImageBaseUrl?.() || 'https://api.openai.com/v1',
+        chatHandler: hasStChatBridge() ? opts => bridge.chatViaSt(opts) : undefined,
         fetchImpl: bridge.fetchImpl ?? globalThis.fetch?.bind(globalThis),
     });
 
@@ -406,7 +421,7 @@ export function createRpStudioController(bridge) {
 
     function renderHudPill() {
         const state = bridge.getChatState();
-        const hasKey = Boolean(bridge.getEffectiveKey());
+        const hasKey = Boolean(bridge.getEffectiveKey()) || hasStChatBridge();
         const locale = bridge.getLocale();
         hudPill.setAttribute('title', t('hud.openDrawer'));
         hudPill.setAttribute('aria-label', t('hud.openDrawer'));
@@ -493,7 +508,7 @@ export function createRpStudioController(bridge) {
             const rubPart = wallet.rub !== null ? ` (${formatRub(wallet.rub)})` : '';
             secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, `💰 ${formatUsd(wallet.usd)}${rubPart}`));
         } else if (hasKey) {
-            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, '⚡ CLODEx'));
+            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, '⚡ ST API'));
         }
 
         const chips = [...primary, ...secondary].slice(0, HUD_MAX_CHIPS);
@@ -696,16 +711,18 @@ export function createRpStudioController(bridge) {
     async function runWikiUpdate({ manual = false } = {}) {
         if (wikiBusy) return false;
         const key = bridge.getEffectiveKey();
-        if (!key) {
-            if (manual) {
-                activeTab = 'account';
-                toggleDrawer(true);
+        if (!hasStChatBridge()) {
+            if (!key) {
+                if (manual) {
+                    activeTab = 'account';
+                    toggleDrawer(true);
+                }
+                return false;
             }
-            return false;
+            if (!catalog.length) await refreshAccount();
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
-        const model = settings.trackerModel || settings.codexModel;
+        const model = getTrackerProfileOrModel(settings);
         if (!model) {
             if (manual) {
                 errorBanner = t('wiki.needModel');
@@ -759,7 +776,7 @@ export function createRpStudioController(bridge) {
                 upserts: Array.isArray(patch?.upsert) ? patch.upsert.length : 0,
                 removes: Array.isArray(patch?.remove) ? patch.remove.length : 0,
             });
-            if (manual) await refreshAccount().catch(() => {});
+            if (manual && key && !hasStChatBridge()) await refreshAccount().catch(() => {});
             return true;
         } catch (err) {
             wikiStatusText = '';
@@ -866,8 +883,10 @@ export function createRpStudioController(bridge) {
             toggleDrawer(true);
             return '';
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
+        if (!catalog.length && !(isPhoto ? settings.imageModel : settings.speechModel)) {
+            await refreshAccount().catch(() => {});
+        }
         const model = isPhoto ? settings.imageModel : settings.speechModel;
         if (!model) {
             errorBanner = t(isPhoto ? 'phone.needImageModel' : 'phone.needSpeechModel');
@@ -1007,16 +1026,18 @@ export function createRpStudioController(bridge) {
 
     async function syncTrackerFromChat({ checkpointKey = '', silent = false } = {}) {
         const key = bridge.getEffectiveKey();
-        if (!key) {
-            if (!silent) {
-                activeTab = 'account';
-                toggleDrawer(true);
+        if (!hasStChatBridge()) {
+            if (!key) {
+                if (!silent) {
+                    activeTab = 'account';
+                    toggleDrawer(true);
+                }
+                return false;
             }
-            return false;
+            if (!catalog.length) await refreshAccount();
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
-        const model = settings.trackerModel;
+        const model = getTrackerProfileOrModel(settings);
         if (!model) {
             if (!silent) errorBanner = 'Select a Tracker model in Key & Models.';
             renderAll();
@@ -1087,19 +1108,20 @@ export function createRpStudioController(bridge) {
         const q = String(questionText ?? codexDraft).trim();
         if (!q) return;
         const key = bridge.getEffectiveKey();
-        if (!key) {
-            activeTab = 'account';
-            renderAll();
-            return;
+        if (!hasStChatBridge()) {
+            if (!key) {
+                activeTab = 'account';
+                renderAll();
+                return;
+            }
+            if (!catalog.length) await refreshAccount();
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
-        let model = settings.codexModel;
-        if (codexPreset === 'biblical_dante' && catalog.length) {
+        let model = getCodexProfileOrModel(settings);
+        if (!hasStChatBridge() && codexPreset === 'biblical_dante' && catalog.length) {
             const mistralCandidate = catalog.find(m => m.kinds.includes('text') && m.mistral);
-            if (mistralCandidate && !model) model = mistralCandidate.id;
+            if (mistralCandidate && !settings.codexModel) model = mistralCandidate.id;
         }
-        if (!model) model = settings.trackerModel;
 
         busyState = 'codex';
         errorBanner = '';
@@ -1144,7 +1166,7 @@ export function createRpStudioController(bridge) {
         if (rp?.charName) currentCharName = rp.charName;
         const state = bridge.getChatState();
         const settings = bridge.getSettings();
-        const promptModel = settings.trackerModel || settings.codexModel;
+        const promptModel = getTrackerProfileOrModel(settings);
         if (promptModel) {
             const msgs = buildSceneVisualPromptMessages({
                 charName: rp.charName,
@@ -1171,11 +1193,13 @@ export function createRpStudioController(bridge) {
             }
             return;
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
+        if (!catalog.length && !settings.imageModel) {
+            await refreshAccount().catch(() => {});
+        }
         const model = settings.imageModel;
         if (!model) {
-            if (!auto) errorBanner = 'Select an Image model (e.g. Nano Banana) in Key & Models.';
+            if (!auto) errorBanner = 'Enter or select an Image model in Key & Models.';
             renderAll();
             return;
         }
@@ -1213,8 +1237,6 @@ export function createRpStudioController(bridge) {
             sceneStatusText = t('scene.statusDone');
             if (auto) {
                 await recordAutoSpendAndRefresh(autoEst);
-            } else {
-                await refreshAccount().catch(() => {});
             }
         } catch (err) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
@@ -1233,8 +1255,8 @@ export function createRpStudioController(bridge) {
             toggleDrawer(true);
             return;
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
+        if (!catalog.length && !settings.videoModel) await refreshAccount().catch(() => {});
         const state = bridge.getChatState();
         const model = settings.videoModel;
         if (!resume && !model) {
@@ -1283,7 +1305,6 @@ export function createRpStudioController(bridge) {
             state.scene.videoTaskId = '';
             await bridge.saveChatState(state);
             sceneStatusText = t('scene.statusDone');
-            await refreshAccount().catch(() => {});
         } catch (err) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
         } finally {
@@ -1300,7 +1321,7 @@ export function createRpStudioController(bridge) {
             toggleDrawer(true);
             return [];
         }
-        if (!catalog.length) await refreshAccount();
+        if (!catalog.length && !bridge.getSettings().speechModel) await refreshAccount().catch(() => {});
         const model = bridge.getSettings().speechModel;
         if (!model) {
             errorBanner = 'Select a Voice (TTS) model in Key & Models.';
@@ -1332,8 +1353,8 @@ export function createRpStudioController(bridge) {
             }
             return '';
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
+        if (!catalog.length && !settings.speechModel) await refreshAccount().catch(() => {});
         const model = settings.speechModel;
         if (!model) {
             if (!auto) errorBanner = 'Select a Voice (TTS) model in Key & Models.';
@@ -1384,8 +1405,6 @@ export function createRpStudioController(bridge) {
             bridge.playAudioPreview?.(savedPath, audioBlob);
             if (auto) {
                 await recordAutoSpendAndRefresh(autoEst);
-            } else {
-                await refreshAccount().catch(() => {});
             }
             return savedPath;
         } catch (err) {
@@ -1406,11 +1425,11 @@ export function createRpStudioController(bridge) {
             toggleDrawer(true);
             return '';
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
+        if (!catalog.length && !settings.imageModel) await refreshAccount().catch(() => {});
         const model = settings.imageModel;
         if (!model) {
-            errorBanner = 'Select an Image model (e.g. Nano Banana) in Key & Models.';
+            errorBanner = 'Enter or select an Image model in Key & Models.';
             renderAll();
             return '';
         }
@@ -1451,7 +1470,6 @@ export function createRpStudioController(bridge) {
                 await bridge.saveChatState(latestState);
             }
             cradleStatusText = t('cradle.statusDone');
-            await refreshAccount().catch(() => {});
             return savedPath;
         } catch (err) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
@@ -1473,8 +1491,8 @@ export function createRpStudioController(bridge) {
             toggleDrawer(true);
             return '';
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
+        if (!catalog.length && !settings.videoModel) await refreshAccount().catch(() => {});
         const model = settings.videoModel;
         if (!resume && !model) {
             errorBanner = 'Select a Video model in Key & Models.';
@@ -1533,7 +1551,6 @@ export function createRpStudioController(bridge) {
                 await bridge.saveChatState(latestState);
             }
             cradleStatusText = t('cradle.statusDone');
-            await refreshAccount().catch(() => {});
             return savedVideoPath;
         } catch (err) {
             if (err?.name !== 'AbortError') errorBanner = redact(err?.message ?? err, key);
@@ -1554,9 +1571,9 @@ export function createRpStudioController(bridge) {
             toggleDrawer(true);
             return '';
         }
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
-        const textModel = settings.trackerModel || settings.codexModel;
+        if (!catalog.length && !settings.speechModel) await refreshAccount().catch(() => {});
+        const textModel = getTrackerProfileOrModel(settings);
         const speechModel = settings.speechModel;
         if (!textModel || !speechModel) {
             errorBanner = 'Select Text and Voice (TTS) models in Key & Models.';
@@ -1595,7 +1612,6 @@ export function createRpStudioController(bridge) {
             companionAudioMap.set(comp.id, savedAudioPath);
             bridge.playAudioPreview?.(savedAudioPath, audioBlob);
             cradleStatusText = '';
-            await refreshAccount().catch(() => {});
             return savedAudioPath;
         } catch (err) {
             errorBanner = redact(err?.message ?? err, key);
@@ -1632,12 +1648,12 @@ export function createRpStudioController(bridge) {
             return null;
         }
         if (!forgeConcept.trim()) return null;
-        if (!catalog.length) await refreshAccount();
         const settings = bridge.getSettings();
-        const textModel = settings.codexModel || settings.trackerModel;
+        if (!catalog.length && !settings.imageModel) await refreshAccount().catch(() => {});
+        const textModel = getCodexProfileOrModel(settings);
         const imageModel = settings.imageModel;
         if (!textModel || !imageModel) {
-            errorBanner = 'Select Text and Image (Nano Banana) models in Key & Models.';
+            errorBanner = 'Enter or select an Image model in Key & Models.';
             renderAll();
             return null;
         }
@@ -1684,7 +1700,6 @@ export function createRpStudioController(bridge) {
                 name: card.data.name,
                 count: card.data.character_book?.entries?.length ?? 0,
             });
-            await refreshAccount().catch(() => {});
             return forgedArtifact;
         } catch (err) {
             errorBanner = redact(err?.message ?? err, key);
@@ -3353,11 +3368,25 @@ export function createRpStudioController(bridge) {
 
     function renderAccountTab() {
         const settings = bridge.getSettings();
-        const inherited = bridge.isKeyInherited?.() ?? false;
+        const isRu = bridge.getLocale() === 'ru';
         const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
 
-        let keyDraft = settings.apiKey || '';
-        const textModels = catalog.filter(m => m.kinds.includes('text') || !m.kinds.length);
+        let urlDraft = settings.imageApiUrl || 'https://api.openai.com/v1';
+        let keyDraft = settings.imageApiKey || settings.apiKey || '';
+        let imageModelDraft = settings.imageModel || '';
+
+        const stProfiles = typeof bridge.getStProfiles === 'function' ? bridge.getStProfiles() : [];
+        const profileOptions = (currentId, fallbackLabel) => {
+            const opts = [
+                { value: '', label: fallbackLabel },
+                ...stProfiles.map(p => ({ value: p.id, label: p.name })),
+            ];
+            if (currentId && !opts.some(o => o.value === currentId)) {
+                opts.push({ value: currentId, label: currentId });
+            }
+            return opts;
+        };
+
         const imageModels = catalog.filter(m => m.kinds.includes('image'));
         const videoModels = catalog.filter(m => m.kinds.includes('video'));
         const speechModels = catalog.filter(m => m.kinds.includes('speech'));
@@ -3380,73 +3409,118 @@ export function createRpStudioController(bridge) {
 
         container.append(el(doc, 'div', { className: 'clodex-rp-card' },
             el(doc, 'h4', { className: 'clodex-rp-card-title' }, `🔑 ${t('account.title')}`),
-            inherited ? el(doc, 'div', { className: 'clodex-rp-badge-line' }, `✅ ${t('account.inheritedBadge')}`) : null,
-            bridge.allowInlineKeyEdit !== false ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
-                el(doc, 'span', {}, t('account.keyLabel')),
-                el(doc, 'input', {
-                    type: 'password',
-                    className: 'clodex-rp-input',
-                    placeholder: 'sk-...',
-                    value: keyDraft,
-                    onInput: e => { keyDraft = e.target.value; },
-                }),
+
+            // 1. SillyTavern Connection Profiles for Text
+            hasStChatBridge() ? el(doc, 'div', { className: 'clodex-rp-subbox' },
+                el(doc, 'strong', {}, isRu ? '🔌 Текстовые запросы (Профили SillyTavern)' : '🔌 Text Requests (SillyTavern Profiles)'),
+                el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
+                    el(doc, 'label', { className: 'clodex-rp-field' },
+                        el(doc, 'span', {}, isRu ? 'Профиль Трекера и Вики' : 'Tracker & Wiki Profile'),
+                        buildSelect(
+                            profileOptions(
+                                settings.stTextProfileId || '',
+                                isRu ? '⚡ Текущее активное подключение ST' : '⚡ Current Active ST Connection',
+                            ),
+                            settings.stTextProfileId || '',
+                            async v => {
+                                await bridge.updateSettings({ stTextProfileId: v });
+                                renderAll();
+                            },
+                        ),
+                    ),
+                    el(doc, 'label', { className: 'clodex-rp-field' },
+                        el(doc, 'span', {}, isRu ? 'Профиль Кодекса и Кузницы' : 'Codex & Forge Profile'),
+                        buildSelect(
+                            profileOptions(
+                                settings.stCodexProfileId || '',
+                                isRu ? '🔗 Как у Трекера (по умолчанию)' : '🔗 Same as Tracker (default)',
+                            ),
+                            settings.stCodexProfileId || '',
+                            async v => {
+                                await bridge.updateSettings({ stCodexProfileId: v });
+                                renderAll();
+                            },
+                        ),
+                    ),
+                ),
             ) : null,
-            el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
-                el(doc, 'button', {
-                    type: 'button',
-                    className: 'clodex-rp-btn clodex-rp-btn-primary',
-                    disabled: busyState === 'account',
-                    onClick: async () => {
-                        if (bridge.allowInlineKeyEdit !== false && keyDraft.trim()) {
-                            await bridge.updateSettings({ apiKey: keyDraft.trim() });
-                        }
-                        await refreshAccount();
-                    },
-                }, `⚡ ${t('account.connectBtn')}`),
-            ),
+
+            // 2. Custom Image Generation API (URL, Key, Model)
             el(doc, 'div', { className: 'clodex-rp-subbox clodex-rp-mt' },
-                el(doc, 'strong', {}, t('account.walletLabel')),
-                el(doc, 'div', {}, wallet
-                    ? `${formatUsd(wallet.usd)}${wallet.rub !== null ? ` · ${formatRub(wallet.rub)}` : ''}`
-                    : t('account.walletUnavailable')),
-                videoBilling?.paidUSD !== null && videoBilling?.paidUSD !== undefined
-                    ? el(doc, 'div', { className: 'clodex-rp-muted' }, t('account.videoPaidNote', { usd: formatUsd(videoBilling.paidUSD) }))
-                    : null,
-                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
-                    el(doc, 'span', { className: 'clodex-rp-muted' }, `🛡️ ${t('account.sessionAutoSpend', {
-                        spent: formatUsd(sessionAutoSpendUsd),
-                        cap: formatUsd(autoCap),
-                    })}`),
-                    sessionAutoSpendUsd > 0 ? el(doc, 'button', {
-                        type: 'button',
-                        className: 'clodex-rp-btn-mini',
-                        onClick: () => {
-                            sessionAutoSpendUsd = 0;
-                            errorBanner = '';
-                            renderDrawer();
+                el(doc, 'strong', {}, isRu ? '🍌 Генерация изображений (Свой URL, Ключ и Модель)' : '🍌 Image Generation (Custom URL, Key & Model)'),
+                el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                    el(doc, 'span', {}, isRu ? 'Ссылка API изображений (Base URL)' : 'Image API Base URL'),
+                    el(doc, 'input', {
+                        type: 'url',
+                        className: 'clodex-rp-input',
+                        placeholder: 'https://api.openai.com/v1',
+                        value: urlDraft,
+                        onInput: e => { urlDraft = e.target.value; },
+                        onChange: async e => {
+                            urlDraft = e.target.value.trim() || 'https://api.openai.com/v1';
+                            await bridge.updateSettings({ imageApiUrl: urlDraft });
                         },
-                    }, t('account.resetAutoSpend')) : null,
-                ),
-            ),
-            el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
-                el(doc, 'label', { className: 'clodex-rp-field' },
-                    el(doc, 'span', {}, t('account.trackerModel')),
-                    buildSelect(modelOptions(textModels, settings.trackerModel), settings.trackerModel, async v => {
-                        await bridge.updateSettings({ trackerModel: v });
                     }),
                 ),
-                el(doc, 'label', { className: 'clodex-rp-field' },
-                    el(doc, 'span', {}, t('account.codexModel')),
-                    buildSelect(modelOptions(textModels, settings.codexModel), settings.codexModel, async v => {
-                        await bridge.updateSettings({ codexModel: v });
+                bridge.allowInlineKeyEdit !== false ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                    el(doc, 'span', {}, isRu ? 'API-ключ для изображений' : 'Image API Key'),
+                    el(doc, 'input', {
+                        type: 'password',
+                        className: 'clodex-rp-input',
+                        placeholder: 'sk-...',
+                        value: keyDraft,
+                        onInput: e => { keyDraft = e.target.value; },
+                        onChange: async e => {
+                            keyDraft = e.target.value.trim();
+                            await bridge.updateSettings({ imageApiKey: keyDraft });
+                            renderHudPill();
+                        },
+                    }),
+                ) : null,
+                el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
+                    el(doc, 'span', {}, isRu ? 'Модель изображений (введите вручную или выберите ниже)' : 'Image Model (type ID or select below)'),
+                    el(doc, 'input', {
+                        type: 'text',
+                        className: 'clodex-rp-input',
+                        placeholder: 'gpt-image-1 / flux / dall-e-3 / nano-banana',
+                        value: imageModelDraft,
+                        onInput: e => { imageModelDraft = e.target.value; },
+                        onChange: async e => {
+                            imageModelDraft = e.target.value.trim();
+                            await bridge.updateSettings({ imageModel: imageModelDraft });
+                        },
                     }),
                 ),
-                el(doc, 'label', { className: 'clodex-rp-field' },
+                (imageModels.length > 0 || catalog.length > 0) ? el(doc, 'label', { className: 'clodex-rp-field clodex-rp-mt' },
                     el(doc, 'span', {}, t('account.imageModel')),
                     buildSelect(modelOptions(imageModels.length ? imageModels : catalog, settings.imageModel), settings.imageModel, async v => {
+                        imageModelDraft = v;
                         await bridge.updateSettings({ imageModel: v });
+                        renderDrawer();
                     }),
+                ) : null,
+                el(doc, 'div', { className: 'clodex-rp-btn-row clodex-rp-mt' },
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: 'clodex-rp-btn clodex-rp-btn-primary',
+                        disabled: busyState === 'account',
+                        onClick: async () => {
+                            await bridge.updateSettings({
+                                imageApiUrl: urlDraft.trim() || 'https://api.openai.com/v1',
+                                imageApiKey: keyDraft.trim(),
+                                imageModel: imageModelDraft.trim(),
+                            });
+                            if (keyDraft.trim()) {
+                                await refreshAccount();
+                            } else {
+                                renderAll();
+                            }
+                        },
+                    }, `⚡ ${isRu ? 'Сохранить и загрузить список моделей' : t('account.connectBtn')}`),
                 ),
+            ),
+
+            el(doc, 'div', { className: 'clodex-rp-grid-2 clodex-rp-mt' },
                 el(doc, 'label', { className: 'clodex-rp-field' },
                     el(doc, 'span', {}, t('account.videoModel')),
                     buildSelect(modelOptions(videoModels.length ? videoModels : catalog, settings.videoModel), settings.videoModel, async v => {
@@ -3523,7 +3597,6 @@ export function createRpStudioController(bridge) {
                     el(doc, 'span', {}, t(labelKey)),
                 )),
             ),
-            el(doc, 'p', { className: 'clodex-rp-muted clodex-rp-mt' }, t('account.getKeyLink')),
         ));
 
         return container;
@@ -3874,7 +3947,7 @@ export function createRpStudioController(bridge) {
         if (consumed) await bridge.saveChatState(state);
 
         let tracked = false;
-        if (settings.autoTrack !== false && bridge.getEffectiveKey()) {
+        if (settings.autoTrack !== false && (hasStChatBridge() || bridge.getEffectiveKey())) {
             tracked = await syncTrackerFromChat({ checkpointKey, silent: true });
         }
         if (!tracked) {
@@ -3920,7 +3993,7 @@ export function createRpStudioController(bridge) {
     applyPillPosition(bridge.loadHudPosition?.());
     syncCachedCharName();
     loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
-    if (bridge.getEffectiveKey()) {
+    if (bridge.getEffectiveKey() && !hasStChatBridge()) {
         refreshAccount().catch(() => {});
     }
 
@@ -3992,4 +4065,4 @@ export function createRpStudioController(bridge) {
             hostRoot.remove();
         },
     };
-}
+            }
