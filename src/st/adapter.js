@@ -1,3 +1,4 @@
+// src/st/adapter.js
 import { base64ToBlob, blobToBase64, validateKey } from '../core/api.js';
 import { ctxPack } from '../core/context.js';
 import { dirBuildCue } from '../core/director.js';
@@ -122,6 +123,10 @@ function normalizeMaxAutoSpend(val) {
 
 export const DEFAULT_ST_SETTINGS = Object.freeze({
     apiKey: '',
+    stTextProfileId: '',
+    stCodexProfileId: '',
+    imageApiUrl: 'https://api.openai.com/v1',
+    imageApiKey: '',
     trackerModel: '',
     codexModel: '',
     imageModel: '',
@@ -144,7 +149,13 @@ export const DEFAULT_ST_SETTINGS = Object.freeze({
 export function loadStSettings(context) {
     const raw = context.extensionSettings?.[ST_SETTINGS_KEY] ?? {};
     const clean = {
-        apiKey: '',
+        apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
+        stTextProfileId: typeof raw.stTextProfileId === 'string' ? raw.stTextProfileId.trim() : '',
+        stCodexProfileId: typeof raw.stCodexProfileId === 'string' ? raw.stCodexProfileId.trim() : '',
+        imageApiUrl: typeof raw.imageApiUrl === 'string' && raw.imageApiUrl.trim()
+            ? raw.imageApiUrl.trim()
+            : 'https://api.openai.com/v1',
+        imageApiKey: typeof raw.imageApiKey === 'string' ? raw.imageApiKey.trim() : '',
         trackerModel: typeof raw.trackerModel === 'string' ? raw.trackerModel : '',
         codexModel: typeof raw.codexModel === 'string' ? raw.codexModel : '',
         imageModel: typeof raw.imageModel === 'string' ? raw.imageModel : '',
@@ -164,13 +175,126 @@ export function loadStSettings(context) {
             ? { x: raw.hudPos.x, y: raw.hudPos.y } : null,
         ...stCleanV13Settings(raw),
     };
-    try {
-        clean.apiKey = raw.apiKey ? validateKey(raw.apiKey) : '';
-    } catch {
-        clean.apiKey = '';
+    if (!clean.imageApiKey && clean.apiKey) {
+        clean.imageApiKey = clean.apiKey;
     }
     if (context.extensionSettings) context.extensionSettings[ST_SETTINGS_KEY] = clean;
     return clean;
+}
+
+export function getStConnectionProfiles(context) {
+    const out = [];
+    const seen = new Set();
+    const pushProfile = p => {
+        if (!p || typeof p !== 'object') return;
+        const id = String(p.id ?? p.name ?? '').trim();
+        if (!id || seen.has(id)) return;
+        seen.add(id);
+        const name = String(p.name ?? p.id ?? id).trim();
+        const api = String(p.api ?? p.mode ?? '').trim();
+        const model = String(p.model ?? '').trim();
+        const suffix = [api, model].filter(Boolean).join(' · ');
+        out.push({
+            id,
+            name: suffix ? `${name} (${suffix})` : name,
+        });
+    };
+    try {
+        const cmService = context?.ConnectionManagerRequestService;
+        if (typeof cmService?.getSupportedProfiles === 'function') {
+            const list = cmService.getSupportedProfiles();
+            if (Array.isArray(list)) list.forEach(pushProfile);
+        }
+    } catch {
+        // Ignore if ConnectionManagerRequestService is unavailable
+    }
+    const rawProfiles = context?.extensionSettings?.connectionManager?.profiles;
+    if (Array.isArray(rawProfiles)) {
+        rawProfiles.forEach(pushProfile);
+    }
+    return out;
+}
+
+async function sendTextRequestViaSillyTavern(context, {
+    profileId = '',
+    messages = [],
+    maxTokens = 600,
+    jsonMode = false,
+} = {}) {
+    const cleanMessages = (Array.isArray(messages) ? messages : [])
+        .filter(m => m && typeof m.content === 'string' && m.content.trim())
+        .map(m => ({
+            role: m.role === 'system' || m.role === 'assistant' ? m.role : 'user',
+            content: m.content,
+        }));
+
+    if (!cleanMessages.length) {
+        throw new Error('Prompt messages are empty.');
+    }
+
+    const cmService = context?.ConnectionManagerRequestService;
+    if (profileId && typeof cmService?.sendRequest === 'function') {
+        const response = await cmService.sendRequest(
+            profileId,
+            cleanMessages,
+            maxTokens,
+            {
+                stream: false,
+                extractData: true,
+                includePreset: false,
+                includeInstruct: false,
+            },
+            jsonMode ? { response_format: { type: 'json_object' } } : {},
+        );
+        const text = typeof response === 'string'
+            ? response
+            : String(response?.content ?? response?.text ?? response?.choices?.[0]?.message?.content ?? '');
+        if (text.trim()) return text.trim();
+    }
+
+    // Fallback to currently active SillyTavern API connection
+    const systemParts = [];
+    const promptParts = [];
+    for (const msg of cleanMessages) {
+        if (msg.role === 'system') {
+            systemParts.push(msg.content);
+        } else {
+            const prefix = msg.role === 'assistant' ? 'Assistant' : 'User';
+            promptParts.push(`${prefix}:\n${msg.content}`);
+        }
+    }
+    const systemPrompt = systemParts.join('\n\n');
+    const userPrompt = promptParts.join('\n\n') || systemPrompt;
+
+    if (typeof context?.generateRaw === 'function') {
+        try {
+            const res = await context.generateRaw({
+                prompt: userPrompt,
+                systemPrompt: promptParts.length ? systemPrompt : '',
+                responseLength: maxTokens,
+                trimNames: false,
+            });
+            const text = String(res ?? '').trim();
+            if (text) return text;
+        } catch {
+            const combined = [systemPrompt, userPrompt].filter(Boolean).join('\n\n');
+            const res = await context.generateRaw(combined, '', false, false, '', maxTokens);
+            const text = String(res ?? '').trim();
+            if (text) return text;
+        }
+    }
+
+    if (typeof context?.generateQuietPrompt === 'function') {
+        const combined = [systemPrompt, userPrompt].filter(Boolean).join('\n\n');
+        const res = await context.generateQuietPrompt({
+            quietPrompt: combined,
+            responseLength: maxTokens,
+        });
+        const text = String(res ?? '').trim();
+        if (text) return text;
+    }
+
+    throw new Error('SillyTavern text generation is unavailable. Configure an API connection or select a Connection Profile.');
 }
 
 async function uploadMediaToSt(context, fetchImpl, blob, ext, prefix = 'clodex-rp') {
@@ -422,22 +546,46 @@ export async function initializeSillyTavern({
         confirm,
         notify: msg => globalThis.toastr?.info?.(msg),
         getEffectiveKey() {
+            if (settings.imageApiKey) return settings.imageApiKey;
             if (settings.apiKey) return settings.apiKey;
             const inherited = getContext()?.extensionSettings?.clodex?.savedKey ?? '';
-            try {
-                return inherited ? validateKey(inherited) : '';
-            } catch {
-                return '';
-            }
+            return String(inherited || '').trim();
+        },
+        getImageBaseUrl() {
+            return String(settings.imageApiUrl || 'https://api.openai.com/v1').trim();
         },
         isKeyInherited() {
-            return !settings.apiKey && Boolean(getContext()?.extensionSettings?.clodex?.savedKey);
+            return !settings.imageApiKey && !settings.apiKey && Boolean(getContext()?.extensionSettings?.clodex?.savedKey);
+        },
+        getStProfiles() {
+            return getStConnectionProfiles(getContext());
+        },
+        async chatViaSt({ model, messages, temperature, maxTokens, jsonMode }) {
+            const requestedProfile = String(model || '').trim();
+            const profileId = requestedProfile && requestedProfile !== '__st_active__'
+                ? requestedProfile
+                : (settings.stTextProfileId || '');
+            return await sendTextRequestViaSillyTavern(getContext(), {
+                profileId,
+                messages,
+                temperature,
+                maxTokens,
+                jsonMode,
+            });
         },
         getSettings: () => settings,
         async updateSettings(patch) {
             for (const [k, v] of Object.entries(patch)) {
                 if (k === 'apiKey') {
                     settings.apiKey = v ? validateKey(v) : '';
+                    if (settings.apiKey && !settings.imageApiKey) settings.imageApiKey = settings.apiKey;
+                } else if (k === 'imageApiKey') {
+                    settings.imageApiKey = String(v ?? '').trim();
+                    settings.apiKey = settings.imageApiKey;
+                } else if (k === 'imageApiUrl') {
+                    settings.imageApiUrl = String(v ?? '').trim() || 'https://api.openai.com/v1';
+                } else if (k === 'stTextProfileId' || k === 'stCodexProfileId') {
+                    settings[k] = String(v ?? '').trim();
                 } else if (k === 'maxAutoSpendUsd') {
                     settings.maxAutoSpendUsd = normalizeMaxAutoSpend(v);
                 } else if (k in V13_DEFAULTS) {
@@ -734,4 +882,4 @@ export async function initializeSillyTavern({
             settingsCard?.remove();
         },
     };
-}
+            }
