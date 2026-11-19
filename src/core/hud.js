@@ -14,8 +14,28 @@ import {
     hatchReadyEggs, layEggs, OMEGA_ROLES, SUPPRESSANT_LEVELS, triggerConception,
 } from './physiology.js';
 import { embedCharacterCardInPng } from './pngCard.js';
-import { buildSceneVisualPromptMessages, buildTrackerExtractionMessages, parseTrackerExtraction } from './prompts.js';
+import {
+    buildSceneVisualPromptMessages, buildTrackerExtractionMessages, parseTrackerExtraction, TRACKER_MAX_TOKENS,
+} from './prompts.js';
 import { extractSpokenDialogue, isSafeVoiceId, normalizeVoices } from './voice.js';
+import {
+    DIRECTOR_MAX_ACTIVE, DIRECTOR_NOTE_MAX, DIRECTOR_PRESETS, dirClear, dirNormalizeCustomPresets, dirSetNote, dirToggle,
+} from './director.js';
+import { slopAnalyze, slopBuildRule } from './slop.js';
+import { packApply, packBuild, packValidate } from './pack.js';
+import {
+    phoneBuildPhotoPrompt, phoneBuildPresentHint, phoneBuildVoiceText, phoneCreateStore, phoneIngestEvents,
+    phoneGc, phoneMarkSeen, phoneNormalizeStore, phoneResolveSkin, phoneReveal, phoneShouldInclude, phoneView, phoneVoiceDuration,
+} from './phone.js';
+import {
+    wikiApplyPatch, wikiBuildUpdateMessages, wikiCreateStore, wikiGc, wikiIsTargetActive, wikiManualEdit, wikiManualRemove,
+    wikiNormalizeStore, wikiParsePatch, wikiShouldUpdate, wikiView,
+} from './wiki.js';
+import { vDirActiveCount, vDirRenderBar } from './views/director.js';
+import { vWikiRender } from './views/codex-wiki.js';
+import { vStyleRender } from './views/codex-style.js';
+import { vPhoneRender } from './views/phone.js';
+import { vPackRender } from './views/packs.js';
 
 const EXORCIST_PRESET_PROMPT = 'Sharp-featured charismatic priest with sculpted jawline and intricate sacred gothic tattoos along neck and hands, wearing a tailored black cassock, holding an ornate silver crucifix aloft during a dramatic exorcism in a candlelit baroque cathedral, swirling incense smoke, golden chiaroscuro lighting, ultra-detailed masterpiece.';
 
@@ -94,6 +114,34 @@ export function createRpStudioController(bridge) {
     let videoBilling = null;
     let activeAbort = null;
 
+    // v1.3 «Director & Living World» UI state (kept in memory; persisted data lives in chat stores)
+    const PHONE_STORE_KEY = 'clodex_rp_phone';
+    const WIKI_STORE_KEY = 'clodex_rp_wiki';
+    const HUD_MAX_CHIPS = 4;
+    let codexSub = 'questions'; // questions | wiki | style
+    let forgeSub = 'forge'; // forge | packs
+    let directorExpanded = false; // collapsed by default (spec §4)
+    let phoneSection = 'notes';
+    let phoneHighlightIds = new Set();
+    let phoneBusyEntryId = '';
+    let phoneStore = null;
+    let wikiStore = null;
+    let activeTurnKeys = null; // null = unknown → every journal op counts as active
+    let phoneCache = { entries: [], unseen: 0 };
+    let wikiCache = { npcs: [], quests: [], places: [], timeline: [] };
+    let livingSignature = '';
+    let livingLoadedAt = 0;
+    let livingPromise = null;
+    let wikiBusy = false;
+    let wikiStatusText = '';
+    let slopHits = [];
+    let slopAnalyzedCount = 0;
+    let packNameDraft = '';
+    let packAuthorDraft = '';
+    let packPreview = null; // { pack, errors }
+    let packStatusText = '';
+    let currentCharDescription = '';
+
     const api = new ClodexApi({
         getKey: () => bridge.getEffectiveKey(),
         fetchImpl: bridge.fetchImpl ?? globalThis.fetch?.bind(globalThis),
@@ -124,15 +172,23 @@ export function createRpStudioController(bridge) {
     });
     const drawerPanel = el(doc, 'section', { className: 'clodex-rp-drawer' });
     drawerBackdrop.append(drawerPanel);
-    hostRoot.append(backdropEl, hudPill, drawerBackdrop);
+    // M1 director strip: compact, collapsed by default, docked right above the chat composer
+    const directorHost = el(doc, 'div', { className: 'clodex-rp-director-host' });
+    hostRoot.append(backdropEl, hudPill, directorHost, drawerBackdrop);
     bridge.mountContainer.append(hostRoot);
 
     function syncCachedCharName() {
         bridge.getRpContext?.().then(rp => {
+            let changed = false;
+            if (rp?.charDescription !== undefined && String(rp.charDescription) !== currentCharDescription) {
+                currentCharDescription = String(rp.charDescription || '');
+                changed = true;
+            }
             if (rp?.charName && rp.charName !== currentCharName) {
                 currentCharName = rp.charName;
-                if (drawerOpen && activeTab === 'scene') renderDrawer();
+                changed = true;
             }
+            if (changed && drawerOpen && (activeTab === 'scene' || activeTab === 'phone')) renderDrawer();
         }).catch(() => {});
     }
 
@@ -280,6 +336,8 @@ export function createRpStudioController(bridge) {
         if (drawerOpen) {
             if (activeTab === 'scene') syncCachedCharName();
             renderDrawer();
+        } else {
+            phoneHighlightIds.clear();
         }
     }
 
@@ -336,10 +394,13 @@ export function createRpStudioController(bridge) {
         hudPill.setAttribute('title', t('hud.openDrawer'));
         hudPill.setAttribute('aria-label', t('hud.openDrawer'));
 
-        const chips = [];
+        // Spec §4: at most 4 chips, priority 📅 date → 🩸/❤️ vitals → 🐣 cradle → 📱 +N / 🎬,
+        // remaining slots are filled by secondary chips (biology, memory hint, meters, key/wallet).
+        const primary = [];
+        const secondary = [];
         const dateStr = formatShortDate(state.world.rpDate, locale);
         const timeStr = t(`time.${state.world.timeOfDay}`);
-        chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-date' }, `📅 ${dateStr} · ${timeStr}`));
+        primary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-date' }, `📅 ${dateStr} · ${timeStr}`));
 
         const primaryRole = state.world.targetMode === 'user' ? 'user' : 'char';
         const entity = state.entities[primaryRole];
@@ -348,9 +409,31 @@ export function createRpStudioController(bridge) {
             const vitText = bleeding
                 ? `🩸 ${t('hud.bleeding')} (${entity.vitals.heartRate})`
                 : `❤️ ${entity.vitals.heartRate} ${t('hud.bpm')} · 🫁 ${t(`vitals.resp.${entity.vitals.respiration}`)}`;
-            chips.push(el(doc, 'span', {
+            primary.push(el(doc, 'span', {
                 className: `clodex-rp-chip ${bleeding ? 'clodex-rp-chip-alert' : ''}`,
             }, vitText));
+        }
+
+        const activeComp = getActiveCompanion(state);
+        if (activeComp) {
+            const safeStage = COMPANION_STAGES.includes(activeComp.stage) ? activeComp.stage : 'infant';
+            const stageLabel = t(`cradle.stage.${safeStage}`);
+            const spark = activeComp.needsStageArt ? ' ✨' : '';
+            primary.push(el(doc, 'span', {
+                className: 'clodex-rp-chip clodex-rp-chip-cradle',
+            }, `🐣 ${activeComp.name} · ${stageLabel} · 💛${Math.round(activeComp.mood ?? 85)}%${spark}`));
+        }
+
+        const unseenPhone = Number(phoneCache.unseen) || 0;
+        const directorArmed = vDirActiveCount(state.world.director) > 0;
+        if (unseenPhone > 0 || directorArmed) {
+            const parts = [];
+            if (unseenPhone > 0) parts.push(t('phone.hudChip', { count: unseenPhone }));
+            if (directorArmed) parts.push(`🎬 ${t('director.hudChip')}`);
+            primary.push(el(doc, 'span', {
+                className: 'clodex-rp-chip clodex-rp-chip-living',
+                dataset: { rpChip: unseenPhone > 0 ? 'phone' : 'director' },
+            }, parts.join(' · ')));
         }
 
         if (state.world.enableAdultBiology && entity?.bio?.mode !== 'none') {
@@ -372,38 +455,31 @@ export function createRpStudioController(bridge) {
                 const icon = phase === 'heat' || phase === 'rut' ? '🔥' : '🌙';
                 bioLabel = `${icon} D${b.cycleDay} · ${t(`bio.phase.${phase}`)}`;
             }
-            chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, bioLabel));
+            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, bioLabel));
         }
 
-        const activeComp = getActiveCompanion(state);
-        if (activeComp) {
-            const safeStage = COMPANION_STAGES.includes(activeComp.stage) ? activeComp.stage : 'infant';
-            const stageLabel = t(`cradle.stage.${safeStage}`);
-            const spark = activeComp.needsStageArt ? ' ✨' : '';
-            chips.push(el(doc, 'span', {
-                className: 'clodex-rp-chip clodex-rp-chip-cradle',
-            }, `🐣 ${activeComp.name} · ${stageLabel} · 💛${Math.round(activeComp.mood ?? 85)}%${spark}`));
+        if (!hasKey) {
+            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-key' }, `🔑 ${t('hud.connectKey')}`));
+        }
+
+        if (state.world.pendingMemoryHint) {
+            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-codex' }, `🧠 ${t('hud.memoryArmed')}`));
         }
 
         if (Array.isArray(state.customMeters)) {
             for (const m of state.customMeters.filter(item => item.showInHud).slice(0, 2)) {
-                chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, `${m.icon} ${m.label}: ${m.value}`));
+                secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-bio' }, `${m.icon} ${m.label}: ${m.value}`));
             }
         }
 
-        if (state.world.pendingMemoryHint) {
-            chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-codex' }, `🧠 ${t('hud.memoryArmed')}`));
-        }
-
-        if (!hasKey) {
-            chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-key' }, `🔑 ${t('hud.connectKey')}`));
-        } else if (wallet) {
+        if (hasKey && wallet) {
             const rubPart = wallet.rub !== null ? ` (${formatRub(wallet.rub)})` : '';
-            chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, `💰 ${formatUsd(wallet.usd)}${rubPart}`));
-        } else {
-            chips.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, '⚡ CLODEx'));
+            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, `💰 ${formatUsd(wallet.usd)}${rubPart}`));
+        } else if (hasKey) {
+            secondary.push(el(doc, 'span', { className: 'clodex-rp-chip clodex-rp-chip-wallet' }, '⚡ CLODEx'));
         }
 
+        const chips = [...primary, ...secondary].slice(0, HUD_MAX_CHIPS);
         hudPill.replaceChildren(...chips);
         syncVideoBackdrop();
     }
@@ -438,6 +514,480 @@ export function createRpStudioController(bridge) {
         }
     }
 
+    // ---------------------------------------------------------------------------------------
+    // v1.3 «Director & Living World» — store loading, journals, Anti-Slop, wiki, phone, packs
+    // ---------------------------------------------------------------------------------------
+    function ensureDirectorState(state) {
+        if (!state.world.director || typeof state.world.director !== 'object') {
+            state.world.director = { activeIds: [], customNote: '' };
+        }
+        if (!Array.isArray(state.world.director.activeIds)) state.world.director.activeIds = [];
+        if (typeof state.world.director.customNote !== 'string') state.world.director.customNote = '';
+        return state.world.director;
+    }
+
+    function asStore(result, fallback) {
+        return result && typeof result === 'object' && Array.isArray(result.journal) ? result : fallback;
+    }
+
+    function recomputeLivingCaches() {
+        if (phoneStore) {
+            const view = phoneView(phoneStore, activeTurnKeys);
+            phoneCache = {
+                entries: Array.isArray(view?.entries) ? view.entries : [],
+                unseen: Number(view?.unseen) || 0,
+            };
+        }
+        if (wikiStore) {
+            const view = wikiView(wikiStore, activeTurnKeys) || {};
+            wikiCache = {
+                npcs: Array.isArray(view.npcs) ? view.npcs : [],
+                quests: Array.isArray(view.quests) ? view.quests : [],
+                places: Array.isArray(view.places) ? view.places : [],
+                timeline: Array.isArray(view.timeline) ? view.timeline : [],
+            };
+        }
+    }
+
+    function livingSignatureOf() {
+        return JSON.stringify([phoneCache, wikiCache, activeTurnKeys]);
+    }
+
+    async function getActiveKeysSafe() {
+        if (typeof bridge.getActiveTurnKeys !== 'function') return null;
+        try {
+            const keys = await bridge.getActiveTurnKeys();
+            return Array.isArray(keys) ? keys.map(String) : null;
+        } catch {
+            return null;
+        }
+    }
+
+    async function getLatestTurnKeySafe(fallback = '') {
+        if (typeof bridge.getLatestTurnKey === 'function') {
+            try {
+                const key = await bridge.getLatestTurnKey();
+                if (key) return String(key);
+            } catch {
+                // fall through to the caller-provided checkpoint key
+            }
+        }
+        return String(fallback || '');
+    }
+
+    // Loads clodex_rp_phone / clodex_rp_wiki + active branch keys. Returns true when visible data changed.
+    async function loadLivingWorld() {
+        if (typeof bridge.loadStore !== 'function') return false;
+        if (livingPromise) return livingPromise;
+        livingPromise = (async () => {
+            const [rawPhone, rawWiki, keys] = await Promise.all([
+                bridge.loadStore(PHONE_STORE_KEY).catch(() => null),
+                bridge.loadStore(WIKI_STORE_KEY).catch(() => null),
+                getActiveKeysSafe(),
+            ]);
+            phoneStore = phoneNormalizeStore(rawPhone || phoneCreateStore());
+            wikiStore = wikiNormalizeStore(rawWiki || wikiCreateStore());
+            activeTurnKeys = keys;
+            recomputeLivingCaches();
+            livingLoadedAt = Date.now();
+            const sig = livingSignatureOf();
+            const changed = sig !== livingSignature;
+            livingSignature = sig;
+            return changed;
+        })().catch(() => false).finally(() => {
+            livingPromise = null;
+        });
+        return livingPromise;
+    }
+
+    function scheduleLivingRefresh() {
+        if (typeof bridge.loadStore !== 'function' || livingPromise) return;
+        if (Date.now() - livingLoadedAt < 2500) return;
+        livingLoadedAt = Date.now();
+        Promise.resolve().then(loadLivingWorld).then(changed => {
+            if (changed) renderAll();
+        }).catch(() => {});
+    }
+
+    async function reloadLivingWorld() {
+        syncCachedCharName();
+        await loadLivingWorld();
+        renderAll();
+    }
+
+    async function savePhoneStore() {
+        if (!phoneStore) return;
+        // Physical GC only when the active branch is known (dead-branch eviction near 48 KB, spec 10.1).
+        if (Array.isArray(activeTurnKeys)) phoneStore = asStore(phoneGc(phoneStore, { activeTurnKeys }), phoneStore);
+        await bridge.saveStore?.(PHONE_STORE_KEY, phoneStore);
+        recomputeLivingCaches();
+        livingSignature = livingSignatureOf();
+    }
+
+    async function saveWikiStore() {
+        if (!wikiStore) return;
+        if (Array.isArray(activeTurnKeys)) wikiStore = asStore(wikiGc(wikiStore, { activeTurnKeys }), wikiStore);
+        await bridge.saveStore?.(WIKI_STORE_KEY, wikiStore);
+        recomputeLivingCaches();
+        livingSignature = livingSignatureOf();
+    }
+
+    function slopModeOf(settings) {
+        return ['off', 'highlight', 'inject'].includes(settings?.slopMode) ? settings.slopMode : 'inject';
+    }
+
+    // M2: fully local — recomputes radar hits and state.world.slopRule from the last 20 character replies.
+    async function recomputeSlop({ state = null, save = true } = {}) {
+        const settings = bridge.getSettings();
+        const target = state || bridge.getChatState();
+        const mode = slopModeOf(settings);
+        let rule = '';
+        if (mode === 'off') {
+            slopHits = [];
+            slopAnalyzedCount = 0;
+        } else {
+            const rp = await bridge.getRpContext?.({ limit: 40 }).catch(() => null);
+            const replies = (rp?.recentMessages ?? [])
+                .filter(m => m && m.role === 'assistant')
+                .map(m => String(m.content ?? ''))
+                .filter(Boolean)
+                .slice(-20);
+            slopAnalyzedCount = replies.length;
+            const chatLocale = /[а-яё]/i.test(replies.join(' ').slice(0, 4000)) ? 'ru' : 'en';
+            const excludeNames = [rp?.charName, rp?.userName, '{{char}}', '{{user}}'].filter(Boolean);
+            const extraPhrases = Array.isArray(settings.slopPhrases) ? settings.slopPhrases : [];
+            slopHits = replies.length ? (slopAnalyze(replies, { excludeNames, locale: chatLocale, extraPhrases }) || []) : [];
+            if (mode === 'inject') {
+                rule = slopBuildRule(slopHits, {
+                    disabled: Array.isArray(settings.slopDisabled) ? settings.slopDisabled : [],
+                    maxPhrases: 6,
+                }) || '';
+            }
+        }
+        if ((target.world.slopRule || '') !== rule) {
+            target.world.slopRule = rule;
+            if (save) await bridge.saveChatState(target);
+        }
+        return rule;
+    }
+
+    function wikiEveryOf(settings) {
+        return Math.max(4, Math.min(20, Number(settings?.wikiEvery) || 8));
+    }
+
+    // M5: the release's only periodic request (~1 per N turns). Bound to targetTurnKey (spec 10.7).
+    async function runWikiUpdate({ manual = false } = {}) {
+        if (wikiBusy) return false;
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            if (manual) {
+                activeTab = 'account';
+                toggleDrawer(true);
+            }
+            return false;
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = settings.trackerModel || settings.codexModel;
+        if (!model) {
+            if (manual) {
+                errorBanner = t('wiki.needModel');
+                renderAll();
+            }
+            return false;
+        }
+        wikiBusy = true;
+        wikiStatusText = t('wiki.refreshing');
+        renderAll();
+        try {
+            const targetTurnKey = await getLatestTurnKeySafe();
+            await loadLivingWorld();
+            const every = wikiEveryOf(settings);
+            const rp = await bridge.getRpContext({ limit: every + 2 });
+            if (rp?.charName) currentCharName = rp.charName;
+            const recent = (rp?.recentMessages ?? []).slice(-(every + 2));
+            if (!recent.length) {
+                wikiStatusText = t('wiki.nothingNew');
+                return false;
+            }
+            const chatText = recent.map(m => String(m?.content ?? '')).join(' ').slice(0, 4000);
+            const messages = wikiBuildUpdateMessages(wikiCache, recent, {
+                locale: /[а-яё]/i.test(chatText) ? 'ru' : 'en',
+                userName: rp?.userName || '',
+                charName: rp?.charName || '',
+            });
+            const raw = await api.chat({ model, messages, temperature: 0.2, maxTokens: 900, jsonMode: true });
+            const patch = wikiParsePatch(raw);
+
+            // Race guard: drop the patch if its turn was swiped / deleted while we waited.
+            const nowKeys = await getActiveKeysSafe();
+            const stillActive = !targetTurnKey || !Array.isArray(nowKeys)
+                || (typeof wikiIsTargetActive === 'function'
+                    ? wikiIsTargetActive(targetTurnKey, nowKeys)
+                    : nowKeys.includes(targetTurnKey));
+            if (!stillActive) {
+                wikiStatusText = t('wiki.discardedStale');
+                return false;
+            }
+            await loadLivingWorld();
+            wikiStore = asStore(wikiApplyPatch(wikiStore, patch, targetTurnKey, wikiCache), wikiStore);
+            await saveWikiStore();
+            // Reset wiki turn counter only after a successful wiki update.
+            const st = bridge.getChatState();
+            if (st?.counters && typeof st.counters === 'object') {
+                st.counters.turnsSinceWiki = 0;
+                await bridge.saveChatState(st);
+            }
+            wikiStatusText = t('wiki.updated', {
+                upserts: Array.isArray(patch?.upsert) ? patch.upsert.length : 0,
+                removes: Array.isArray(patch?.remove) ? patch.remove.length : 0,
+            });
+            if (manual) await refreshAccount().catch(() => {});
+            return true;
+        } catch (err) {
+            wikiStatusText = '';
+            if (manual) errorBanner = redact(err?.message ?? err, key);
+            return false;
+        } finally {
+            wikiBusy = false;
+            renderAll();
+        }
+    }
+
+    async function saveWikiRow(table, row) {
+        await loadLivingWorld();
+        if (!wikiStore) wikiStore = wikiNormalizeStore(wikiCreateStore());
+        const turnKey = await getLatestTurnKeySafe();
+        wikiStore = asStore(wikiManualEdit(wikiStore, table, row, turnKey), wikiStore);
+        await saveWikiStore();
+        bridge.notify?.(t('wiki.savedNotice'));
+        renderAll();
+    }
+
+    async function removeWikiRow(table, row) {
+        if (typeof wikiManualRemove !== 'function' || !row?.id) return;
+        await loadLivingWorld();
+        const turnKey = await getLatestTurnKeySafe();
+        wikiStore = asStore(wikiManualRemove(wikiStore, table, row.id, turnKey), wikiStore);
+        await saveWikiStore();
+        renderAll();
+    }
+
+    async function setPhoneSkin(skin) {
+        const clean = ['auto', 'smartphone', 'grimoire'].includes(skin) ? skin : 'auto';
+        await loadLivingWorld();
+        if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+        phoneStore.skin = clean;
+        phoneStore = phoneNormalizeStore(phoneStore);
+        await savePhoneStore();
+        if (bridge.getSettings().phoneSkin !== clean) {
+            await bridge.updateSettings({ phoneSkin: clean });
+        }
+        renderAll();
+    }
+
+    function resolvePhoneSkin(state) {
+        const settings = bridge.getSettings();
+        const storeSkin = phoneStore?.skin;
+        if (storeSkin === 'smartphone' || storeSkin === 'grimoire') return storeSkin;
+        if (settings.phoneSkin === 'smartphone' || settings.phoneSkin === 'grimoire') return settings.phoneSkin;
+        try {
+            const resolved = phoneResolveSkin(phoneStore || phoneCreateStore(), state, currentCharDescription);
+            return resolved === 'grimoire' ? 'grimoire' : 'smartphone';
+        } catch {
+            return 'smartphone';
+        }
+    }
+
+    async function markPhoneSeen() {
+        if (!phoneStore || !phoneCache.unseen) return;
+        const ids = phoneCache.entries.map(e => e.id).filter(Boolean);
+        phoneStore = asStore(phoneMarkSeen(phoneStore, ids), phoneStore);
+        await savePhoneStore();
+        renderAll();
+    }
+
+    async function presentPhoneEntry(entry) {
+        if (!entry) return;
+        const state = bridge.getChatState();
+        let hint = '';
+        try {
+            hint = phoneBuildPresentHint(entry) || '';
+        } catch {
+            hint = '';
+        }
+        if (!hint) hint = `[${String(entry.author || '').slice(0, 60)}] ${String(entry.text || '').slice(0, 600)}`;
+        state.world.pendingMemoryHint = String(hint).slice(0, 1200);
+        await bridge.saveChatState(state);
+        bridge.notify?.(t('phone.presentedNotice'));
+        renderAll();
+    }
+
+    async function savePhoneMediaAsset(entry, blob, base64) {
+        if (typeof bridge.savePhoneMedia === 'function') {
+            const saved = await bridge.savePhoneMedia({ entryId: entry.id, kind: entry.kind, blob, base64 });
+            if (saved) return String(saved);
+        }
+        if (typeof URL?.createObjectURL === 'function' && blob) {
+            const objUrl = URL.createObjectURL(blob);
+            companionObjectUrls.push(objUrl);
+            return objUrl;
+        }
+        return '';
+    }
+
+    // M4 Click-to-Reveal: the ONLY place where phone media costs money — explicit click, confirmPaid,
+    // and the spend is counted against the session maxAutoSpendUsd cap.
+    async function revealPhoneEntry(entry) {
+        if (!entry?.id || phoneBusyEntryId) return '';
+        const isPhoto = entry.kind === 'photo';
+        if (!isPhoto && entry.kind !== 'voice') return '';
+        if (entry.mediaPath) return entry.mediaPath;
+        const key = bridge.getEffectiveKey();
+        if (!key) {
+            activeTab = 'account';
+            toggleDrawer(true);
+            return '';
+        }
+        if (!catalog.length) await refreshAccount();
+        const settings = bridge.getSettings();
+        const model = isPhoto ? settings.imageModel : settings.speechModel;
+        if (!model) {
+            errorBanner = t(isPhoto ? 'phone.needImageModel' : 'phone.needSpeechModel');
+            renderAll();
+            return '';
+        }
+        const guard = checkAutoSpendAllowed(model, isPhoto ? 'image' : 'tts');
+        if (!guard.allowed) return '';
+        if (settings.confirmPaid !== false) {
+            const ok = await bridge.confirm(t('confirm.paidMedia', { kind: isPhoto ? 'Phone Photo' : 'Phone Voice', model }));
+            if (!ok) return '';
+        }
+
+        phoneBusyEntryId = entry.id;
+        errorBanner = '';
+        renderAll();
+        try {
+            const rp = await bridge.getRpContext();
+            if (rp?.charName) currentCharName = rp.charName;
+            const state = bridge.getChatState();
+            const vitals = state.entities?.char?.vitals ?? {};
+            let blob;
+            let base64;
+            if (isPhoto) {
+                const prompt = phoneBuildPhotoPrompt(entry, {
+                    charName: rp?.charName || '',
+                    charDescription: rp?.charDescription || '',
+                    vitals,
+                    skin: resolvePhoneSkin(state),
+                });
+                const res = await api.image({ model, prompt });
+                blob = res.b64_json ? base64ToBlob(res.b64_json, 'image/png') : await api.downloadImage(res.url);
+                base64 = res.b64_json || await blobToBase64(blob);
+            } else {
+                const input = phoneBuildVoiceText(entry, vitals);
+                if (!input) throw new Error(t('voice.noDialogue'));
+                const rawVoice = settings.voiceMap?.[rp?.charName] || settings.defaultVoice || 'alloy';
+                const voice = isSafeVoiceId(rawVoice) ? rawVoice : 'alloy';
+                blob = await api.speech({ model, input, voice });
+                base64 = await blobToBase64(blob);
+            }
+            const path = await savePhoneMediaAsset(entry, blob, base64);
+            if (!path) throw new Error(t('phone.saveFailed'));
+            await loadLivingWorld();
+            if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+            phoneStore = asStore(phoneReveal(phoneStore, entry.id, path, entry.turnKey || ''), phoneStore);
+            await savePhoneStore();
+            await recordAutoSpendAndRefresh(guard.est);
+            if (!isPhoto) bridge.playAudioPreview?.(path, blob);
+            return path;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err, key);
+            return '';
+        } finally {
+            phoneBusyEntryId = '';
+            renderAll();
+        }
+    }
+
+    function currentPackCounts() {
+        const settings = bridge.getSettings();
+        const len = v => (Array.isArray(v) ? v.length : 0);
+        return {
+            directorPresets: len(settings.directorPresets),
+            slopPhrases: len(settings.slopPhrases),
+            meterPacks: len(settings.meterPacks),
+            codexPresets: len(settings.codexPresets),
+        };
+    }
+
+    async function exportCurrentPack() {
+        try {
+            const settings = bridge.getSettings();
+            const locale = bridge.getLocale() === 'ru' ? 'ru' : 'en';
+            const pack = packBuild({ ...settings, phoneSkin: phoneStore?.skin || settings.phoneSkin || 'auto' }, {
+                name: packNameDraft.trim() || t('pack.defaultName'),
+                author: packAuthorDraft.trim(),
+                locale,
+            });
+            const checked = packValidate(pack);
+            if (!checked?.ok) throw new Error((checked?.errors || []).join('; ') || t('pack.invalid'));
+            if (typeof bridge.exportPack !== 'function') throw new Error(t('pack.unsupported'));
+            await bridge.exportPack(checked.pack);
+            packStatusText = t('pack.exported');
+        } catch (err) {
+            packStatusText = '';
+            errorBanner = redact(err?.message ?? err);
+        }
+        renderAll();
+    }
+
+    async function pickPackForImport() {
+        try {
+            if (typeof bridge.importPack !== 'function') throw new Error(t('pack.unsupported'));
+            const raw = await bridge.importPack();
+            if (!raw) return;
+            const res = packValidate(raw);
+            const localize = code => (/^pack\.error\.[a-zA-Z]+$/.test(String(code)) ? t(String(code)) : String(code));
+            packPreview = {
+                pack: res?.ok ? res.pack : null,
+                errors: Array.isArray(res?.errors) ? res.errors.map(localize) : [],
+                removed: Array.isArray(res?.removed) ? res.removed.map(String) : [],
+            };
+            if (!res?.ok && !packPreview.errors.length) packPreview.errors.push(t('pack.invalid'));
+            packStatusText = '';
+        } catch (err) {
+            packPreview = { pack: null, errors: [redact(err?.message ?? err)] };
+        }
+        renderAll();
+    }
+
+    async function confirmPackImport() {
+        if (!packPreview?.pack) return;
+        try {
+            const settings = bridge.getSettings();
+            const { settings: next } = packApply({ ...settings }, packPreview.pack) || {};
+            if (next && typeof next === 'object') {
+                const patch = {};
+                for (const k of ['directorPresets', 'slopPhrases', 'meterPacks', 'codexPresets', 'phoneSkin', 'slopDisabled']) {
+                    if (k in next) patch[k] = next[k];
+                }
+                await bridge.updateSettings(patch);
+                if (patch.phoneSkin && typeof bridge.saveStore === 'function') {
+                    await loadLivingWorld();
+                    if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+                    phoneStore.skin = patch.phoneSkin;
+                    await savePhoneStore();
+                }
+            }
+            packStatusText = t('pack.imported', { name: String(packPreview.pack.name || '').slice(0, 80) });
+            packPreview = null;
+        } catch (err) {
+            errorBanner = redact(err?.message ?? err);
+        }
+        renderAll();
+    }
+
     async function syncTrackerFromChat({ checkpointKey = '', silent = false } = {}) {
         const key = bridge.getEffectiveKey();
         if (!key) {
@@ -448,7 +998,8 @@ export function createRpStudioController(bridge) {
             return false;
         }
         if (!catalog.length) await refreshAccount();
-        const model = bridge.getSettings().trackerModel;
+        const settings = bridge.getSettings();
+        const model = settings.trackerModel;
         if (!model) {
             if (!silent) errorBanner = 'Select a Tracker model in Key & Models.';
             renderAll();
@@ -456,21 +1007,54 @@ export function createRpStudioController(bridge) {
         }
         const rp = await bridge.getRpContext();
         if (rp?.charName) currentCharName = rp.charName;
+        if (rp?.charDescription) currentCharDescription = String(rp.charDescription);
         if (!rp.recentMessages?.length) return false;
 
         busyState = 'tracker';
         errorBanner = '';
         renderAll();
         try {
+            // 1. turnKey of the reply being analysed (variant-aware), 2. phone cadence gate (spec 10.6)
+            const turnKey = await getLatestTurnKeySafe(checkpointKey);
             const state = bridge.getChatState();
+            const includePhone = Boolean(phoneShouldInclude(state));
             const messages = buildTrackerExtractionMessages(state, rp.recentMessages, {
                 userName: rp.userName,
                 charName: rp.charName,
+                includePhone,
             });
-            const raw = await api.chat({ model, messages, temperature: 0.15, maxTokens: 550, jsonMode: true });
-            const delta = parseTrackerExtraction(raw);
-            applyTurnExtraction(state, delta, { checkpointKey });
+            // 3. one background request per turn, budget TRACKER_MAX_TOKENS (spec 10.4)
+            const raw = await api.chat({ model, messages, temperature: 0.15, maxTokens: TRACKER_MAX_TOKENS, jsonMode: true });
+            let delta = {};
+            try {
+                delta = parseTrackerExtraction(raw) || {};
+            } catch (parseErr) {
+                // Truncated / invalid JSON never breaks the turn: apply an empty delta.
+                delta = {};
+                if (!silent) errorBanner = redact(parseErr?.message ?? parseErr, key);
+            }
+            const phoneEvents = includePhone && Array.isArray(delta.phoneEvents) ? delta.phoneEvents.slice(0, 2) : [];
+            if (!includePhone && 'phoneEvents' in delta) delete delta.phoneEvents;
+            // 4. compact state + checkpoint for this exact variant
+            applyTurnExtraction(state, delta, { checkpointKey: turnKey || checkpointKey });
+            // 6. Anti-Slop rule is recomputed locally after every reply (0 requests)
+            try {
+                await recomputeSlop({ state, save: false });
+            } catch {
+                // radar failures must never block the tracker
+            }
             await bridge.saveChatState(state);
+            // 5. phone journal (separate store, append-only, bound to turnKey)
+            if (phoneEvents.length && typeof bridge.saveStore === 'function') {
+                await loadLivingWorld();
+                if (!phoneStore) phoneStore = phoneNormalizeStore(phoneCreateStore());
+                phoneStore = asStore(phoneIngestEvents(phoneStore, phoneEvents, turnKey || checkpointKey), phoneStore);
+                await savePhoneStore();
+            }
+            // 7. periodic wiki refresh in the background, bound to targetTurnKey
+            if (settings.wikiEnabled !== false && wikiShouldUpdate(state, wikiEveryOf(settings))) {
+                runWikiUpdate({ manual: false }).catch(() => {});
+            }
             if (!silent) bridge.notify?.(t('notice.trackerUpdated'));
             return true;
         } catch (err) {
@@ -507,9 +1091,12 @@ export function createRpStudioController(bridge) {
             const state = bridge.getChatState();
             const rp = await bridge.getRpContext();
             if (rp?.charName) currentCharName = rp.charName;
+            const customPackPreset = codexPreset.startsWith('pack:')
+                ? (Array.isArray(settings.codexPresets) ? settings.codexPresets.find(p => `pack:${p?.id}` === codexPreset) : null)
+                : null;
             const messages = buildCodexMessages({
-                preset: codexPreset,
-                customPrompt: codexCustomPrompt,
+                preset: customPackPreset ? 'custom' : codexPreset,
+                customPrompt: customPackPreset ? customPackPreset.prompt : codexCustomPrompt,
                 question: q,
                 history: state.codexHistory,
                 charName: rp.charName,
@@ -1818,6 +2405,7 @@ export function createRpStudioController(bridge) {
         }
 
         // Custom Story Meters & Inventory Card
+        const importedMeterPacks = Array.isArray(bridge.getSettings().meterPacks) ? bridge.getSettings().meterPacks : [];
         const metersCard = el(doc, 'div', { className: 'clodex-rp-card' },
             el(doc, 'h4', { className: 'clodex-rp-card-title' }, `📊 ${t('meters.title')}`),
             el(doc, 'div', { className: 'clodex-rp-chips' },
@@ -1834,6 +2422,20 @@ export function createRpStudioController(bridge) {
                         renderAll();
                     },
                 }, label)),
+                ...importedMeterPacks.filter(p => p && Array.isArray(p.meters)).map(pack => el(doc, 'button', {
+                    type: 'button',
+                    className: 'clodex-rp-chip-btn',
+                    onClick: async () => {
+                        for (const tpl of pack.meters) {
+                            if (state.customMeters.length >= 8) break;
+                            if (tpl?.id && !state.customMeters.some(m => m.id === tpl.id)) {
+                                state.customMeters.push({ ...tpl });
+                            }
+                        }
+                        await bridge.saveChatState(state);
+                        renderAll();
+                    },
+                }, `+ ${String(pack.name || pack.id).slice(0, 32)}`)),
             ),
             state.customMeters.length === 0
                 ? el(doc, 'div', { className: 'clodex-rp-muted clodex-rp-mt' }, t('meters.empty'))
@@ -2300,12 +2902,20 @@ export function createRpStudioController(bridge) {
             ));
         }
 
+        const importedCodexPresets = Array.isArray(bridge.getSettings().codexPresets) ? bridge.getSettings().codexPresets : [];
+        const codexOptions = [
+            ...Object.keys(CODEX_PRESETS).map(k => ({ value: k, label: t(`codex.preset.${k}`) })),
+            ...importedCodexPresets.filter(p => p?.id && p?.prompt).map(p => ({
+                value: `pack:${p.id}`,
+                label: String(p.name || p.id).slice(0, 60),
+            })),
+        ];
         const headerCard = el(doc, 'div', { className: 'clodex-rp-card' },
             el(doc, 'h4', { className: 'clodex-rp-card-title' }, `📜 ${t('codex.title')}`),
             el(doc, 'label', { className: 'clodex-rp-field' },
                 el(doc, 'span', {}, t('codex.preset')),
                 buildSelect(
-                    Object.keys(CODEX_PRESETS).map(k => ({ value: k, label: t(`codex.preset.${k}`) })),
+                    codexOptions,
                     codexPreset,
                     async val => {
                         codexPreset = val;
@@ -2883,11 +3493,238 @@ export function createRpStudioController(bridge) {
                     }),
                     el(doc, 'span', {}, t('account.confirmPaid')),
                 ),
+                ...[
+                    ['showInnerThoughts', 'turn.settingThoughts'],
+                    ['showSuggestedActions', 'turn.settingActions'],
+                    ['thoughtsBlurred', 'turn.settingBlurred'],
+                ].map(([settingKey, labelKey]) => el(doc, 'label', { className: 'clodex-rp-check' },
+                    el(doc, 'input', {
+                        type: 'checkbox',
+                        checked: settings[settingKey] !== false,
+                        onChange: async e => { await bridge.updateSettings({ [settingKey]: e.target.checked }); },
+                    }),
+                    el(doc, 'span', {}, t(labelKey)),
+                )),
             ),
             el(doc, 'p', { className: 'clodex-rp-muted clodex-rp-mt' }, t('account.getKeyLink')),
         ));
 
         return container;
+    }
+
+    function applyDirectorPosition() {
+        const insets = bridge.getInsets?.() ?? { topBar: 10, bottomInput: 64 };
+        const rawBottom = insets?.bottomInput;
+        const bottom = Math.max(0, Number.isFinite(Number(rawBottom)) ? Number(rawBottom) : 64) + 6;
+        directorHost.style.bottom = `${bottom}px`;
+    }
+
+    function renderDirectorBar() {
+        // Never wipe a note the player is typing right now (background renders happen during tracker runs).
+        const focused = doc.activeElement;
+        if (focused && focused !== doc.body && directorHost.contains?.(focused)
+            && (focused.tagName === 'INPUT' || focused.tagName === 'TEXTAREA')) return;
+        const state = bridge.getChatState();
+        const director = ensureDirectorState(state);
+        const settings = bridge.getSettings();
+        directorHost.replaceChildren(vDirRenderBar(doc, t, {
+            presets: DIRECTOR_PRESETS,
+            customPresets: dirNormalizeCustomPresets(settings.directorPresets),
+            director,
+            expanded: directorExpanded,
+            maxActive: DIRECTOR_MAX_ACTIVE,
+            noteMax: DIRECTOR_NOTE_MAX,
+        }, {
+            onToggleExpand: () => {
+                directorExpanded = !directorExpanded;
+                renderDirectorBar();
+            },
+            onToggle: async id => {
+                const st = bridge.getChatState();
+                ensureDirectorState(st);
+                dirToggle(st, id);
+                await bridge.saveChatState(st);
+                renderAll();
+            },
+            onNote: async text => {
+                const st = bridge.getChatState();
+                ensureDirectorState(st);
+                dirSetNote(st, text);
+                await bridge.saveChatState(st);
+                if (doc.activeElement?.dataset?.rpAction === 'director-note') {
+                    doc.activeElement.blur?.();
+                }
+                renderAll();
+            },
+            onClear: async () => {
+                const st = bridge.getChatState();
+                dirClear(st);
+                await bridge.saveChatState(st);
+                renderAll();
+            },
+        }));
+        applyDirectorPosition();
+    }
+
+    function renderCodexSubNav() {
+        const subs = [
+            ['questions', `❓ ${t('codex.sub.questions')}`],
+            ['wiki', `📚 ${t('codex.sub.wiki')}`],
+            ['style', `🎯 ${t('codex.sub.style')}`],
+        ];
+        return el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-seg-3 clodex-rp-subtabs', dataset: { rpView: 'codex-subtabs' } },
+            ...subs.map(([id, label]) => el(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-seg-btn ${codexSub === id ? 'active' : ''}`,
+                dataset: { rpAction: 'codex-sub', sub: id },
+                onClick: () => {
+                    codexSub = id;
+                    if (id === 'wiki') loadLivingWorld().then(changed => { if (changed) renderAll(); });
+                    if (id === 'style' && !slopAnalyzedCount) recomputeSlop().then(() => renderAll()).catch(() => {});
+                    renderDrawer();
+                },
+            }, label)),
+        );
+    }
+
+    function renderWikiSub() {
+        const settings = bridge.getSettings();
+        const container = el(doc, 'div', { className: 'clodex-rp-tab-body' }, renderCodexSubNav());
+        container.append(vWikiRender(doc, t, {
+            view: wikiCache,
+            enabled: settings.wikiEnabled !== false,
+            every: wikiEveryOf(settings),
+            busy: wikiBusy,
+            status: wikiStatusText,
+        }, {
+            onRefresh: () => runWikiUpdate({ manual: true }),
+            onSave: (table, row) => saveWikiRow(table, row),
+            onRemove: (table, row) => removeWikiRow(table, row),
+            onToggleEnabled: async enabled => {
+                await bridge.updateSettings({ wikiEnabled: Boolean(enabled) });
+                renderDrawer();
+            },
+            onEvery: async every => {
+                await bridge.updateSettings({ wikiEvery: Math.max(4, Math.min(20, Number(every) || 8)) });
+                renderDrawer();
+            },
+        }));
+        return container;
+    }
+
+    function renderStyleSub(state) {
+        const settings = bridge.getSettings();
+        const container = el(doc, 'div', { className: 'clodex-rp-tab-body' }, renderCodexSubNav());
+        container.append(vStyleRender(doc, t, {
+            mode: slopModeOf(settings),
+            hits: slopHits,
+            disabled: Array.isArray(settings.slopDisabled) ? settings.slopDisabled : [],
+            rule: state.world.slopRule || '',
+            analyzed: slopAnalyzedCount,
+        }, {
+            onMode: async mode => {
+                await bridge.updateSettings({ slopMode: mode });
+                await recomputeSlop().catch(() => {});
+                renderAll();
+            },
+            onToggle: async (phrase, enabled) => {
+                const current = new Set(Array.isArray(bridge.getSettings().slopDisabled) ? bridge.getSettings().slopDisabled : []);
+                if (enabled) current.delete(phrase);
+                else current.add(phrase);
+                await bridge.updateSettings({ slopDisabled: [...current].slice(-200) });
+                await recomputeSlop().catch(() => {});
+                renderAll();
+            },
+            onRecompute: async () => {
+                await recomputeSlop().catch(err => { errorBanner = redact(err?.message ?? err); });
+                renderAll();
+            },
+        }));
+        return container;
+    }
+
+    function renderPhoneScreen(state) {
+        const container = el(doc, 'div', { className: 'clodex-rp-tab-body' });
+        const settings = bridge.getSettings();
+        const seen = new Set(Array.isArray(phoneStore?.seenIds) ? phoneStore.seenIds : []);
+        for (const entry of phoneCache.entries) {
+            if (entry?.id && !seen.has(entry.id)) phoneHighlightIds.add(entry.id);
+        }
+        const selectedSkin = phoneStore?.skin && phoneStore.skin !== 'auto'
+            ? phoneStore.skin
+            : (settings.phoneSkin || 'auto');
+        container.append(vPhoneRender(doc, t, {
+            entries: phoneCache.entries,
+            unseen: phoneCache.unseen,
+            unseenIds: phoneHighlightIds,
+            section: phoneSection,
+            skin: selectedSkin,
+            resolvedSkin: resolvePhoneSkin(state),
+            busyEntryId: phoneBusyEntryId,
+            charName: currentCharName,
+            pendingHint: Boolean(state.world.pendingMemoryHint),
+            resolveSrc: path => bridge.resolveMediaSrc?.(path) || path,
+            voiceDuration: entry => {
+                try {
+                    return phoneVoiceDuration(entry);
+                } catch {
+                    return '';
+                }
+            },
+        }, {
+            onSection: id => {
+                phoneSection = id;
+                renderDrawer();
+            },
+            onSkin: skin => setPhoneSkin(skin),
+            onReveal: entry => revealPhoneEntry(entry),
+            onPresent: entry => presentPhoneEntry(entry),
+        }));
+        if (phoneCache.unseen > 0) Promise.resolve().then(markPhoneSeen).catch(() => {});
+        return container;
+    }
+
+    function renderPacksSub() {
+        return vPackRender(doc, t, {
+            name: packNameDraft,
+            author: packAuthorDraft,
+            preview: packPreview,
+            status: packStatusText,
+            counts: currentPackCounts(),
+        }, {
+            onName: v => { packNameDraft = v; },
+            onAuthor: v => { packAuthorDraft = v; },
+            onExport: () => exportCurrentPack(),
+            onPickImport: () => pickPackForImport(),
+            onConfirmImport: () => confirmPackImport(),
+            onCancelImport: () => {
+                packPreview = null;
+                renderDrawer();
+            },
+        });
+    }
+
+    function renderForgeScreen() {
+        const subNav = el(doc, 'nav', { className: 'clodex-rp-seg clodex-rp-subtabs', dataset: { rpView: 'forge-subtabs' } },
+            ...[
+                ['forge', `⚒️ ${t('tab.forge')}`],
+                ['packs', `📦 ${t('pack.tab')}`],
+            ].map(([id, label]) => el(doc, 'button', {
+                type: 'button',
+                className: `clodex-rp-seg-btn ${forgeSub === id ? 'active' : ''}`,
+                dataset: { rpAction: 'forge-sub', sub: id },
+                onClick: () => {
+                    forgeSub = id;
+                    renderDrawer();
+                },
+            }, label)),
+        );
+        if (forgeSub === 'packs') {
+            return el(doc, 'div', { className: 'clodex-rp-tab-body' }, subNav, renderPacksSub());
+        }
+        const body = renderForgeTab();
+        body.prepend ? body.prepend(subNav) : body.append(subNav);
+        return body;
     }
 
     function renderDrawer() {
@@ -2902,17 +3739,38 @@ export function createRpStudioController(bridge) {
             ['scene', `🍌 ${t('tab.scene')}`],
         ];
 
-        const body = activeTab === 'cradle' ? renderCradleTab(state)
-            : activeTab === 'codex' ? renderCodexTab(state)
-                : activeTab === 'scene' ? renderSceneTab(state)
-                    : activeTab === 'forge' ? renderForgeTab()
-                        : activeTab === 'account' ? renderAccountTab()
-                            : renderTrackerTab(state);
+        let body;
+        if (activeTab === 'cradle') body = renderCradleTab(state);
+        else if (activeTab === 'codex') {
+            body = codexSub === 'wiki' ? renderWikiSub()
+                : codexSub === 'style' ? renderStyleSub(state)
+                    : renderCodexTab(state);
+            if (codexSub !== 'wiki' && codexSub !== 'style') {
+                body.prepend ? body.prepend(renderCodexSubNav()) : body.append(renderCodexSubNav());
+            }
+        } else if (activeTab === 'scene') body = renderSceneTab(state);
+        else if (activeTab === 'forge') body = renderForgeScreen();
+        else if (activeTab === 'account') body = renderAccountTab();
+        else if (activeTab === 'phone') body = renderPhoneScreen(state);
+        else body = renderTrackerTab(state);
 
+        const unseen = Number(phoneCache.unseen) || 0;
         drawerPanel.replaceChildren(
             el(doc, 'header', { className: 'clodex-rp-drawer-head' },
                 el(doc, 'strong', { className: 'clodex-rp-brand' }, t('plugin.name')),
                 el(doc, 'div', { className: 'clodex-rp-head-actions' },
+                    el(doc, 'button', {
+                        type: 'button',
+                        className: `clodex-rp-btn-mini clodex-rp-phone-btn ${activeTab === 'phone' ? 'active' : ''}`,
+                        title: t('phone.open'),
+                        'aria-label': t('phone.open'),
+                        dataset: { rpAction: 'open-phone' },
+                        onClick: () => {
+                            activeTab = 'phone';
+                            loadLivingWorld().then(changed => { if (changed) renderAll(); });
+                            renderDrawer();
+                        },
+                    }, '📱', unseen > 0 ? el(doc, 'span', { className: 'clodex-rp-head-badge' }, String(Math.min(unseen, 99))) : null),
                     el(doc, 'button', {
                         type: 'button',
                         className: `clodex-rp-btn-mini ${activeTab === 'forge' ? 'active' : ''}`,
@@ -2970,19 +3828,34 @@ export function createRpStudioController(bridge) {
 
     function renderAll() {
         renderHudPill();
+        renderDirectorBar();
         if (drawerOpen) renderDrawer();
+        scheduleLivingRefresh();
     }
 
     async function onAssistantMessageCommitted({ checkpointKey = '' } = {}) {
         const settings = bridge.getSettings();
         const state = bridge.getChatState();
 
+        // One-turn data is consumed only after a successfully committed reply (429 / Stop keep it).
+        let consumed = false;
         if (state.world.pendingMemoryHint) {
             state.world.pendingMemoryHint = '';
-            await bridge.saveChatState(state);
+            consumed = true;
         }
+        if (vDirActiveCount(state.world.director) > 0) {
+            dirClear(state);
+            consumed = true;
+        }
+        if (consumed) await bridge.saveChatState(state);
+
+        let tracked = false;
         if (settings.autoTrack !== false && bridge.getEffectiveKey()) {
-            await syncTrackerFromChat({ checkpointKey, silent: true });
+            tracked = await syncTrackerFromChat({ checkpointKey, silent: true });
+        }
+        if (!tracked) {
+            // Anti-Slop is local: keep the radar fresh even without a key / with auto-track disabled.
+            await recomputeSlop().catch(() => {});
         }
         if (settings.autoSpeak === true && bridge.getEffectiveKey()) {
             await speakLatestReply({ auto: true });
@@ -2999,27 +3872,65 @@ export function createRpStudioController(bridge) {
                 await bridge.saveChatState(latestState);
             }
         }
+        await loadLivingWorld();
         renderAll();
     }
 
     const unsubLocale = bridge.onLocaleChange?.(() => renderAll());
-    const unsubInsets = bridge.onInsetsChange?.(() => applyPillPosition(bridge.loadHudPosition?.()));
-    const onResize = () => applyPillPosition(bridge.loadHudPosition?.());
+    const unsubInsets = bridge.onInsetsChange?.(() => {
+        applyPillPosition(bridge.loadHudPosition?.());
+        applyDirectorPosition();
+    });
+    const onResize = () => {
+        applyPillPosition(bridge.loadHudPosition?.());
+        applyDirectorPosition();
+    };
     win.addEventListener?.('resize', onResize);
 
     // Initial render & background catalog load if key already present
     renderAll();
     applyPillPosition(bridge.loadHudPosition?.());
     syncCachedCharName();
+    loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
     if (bridge.getEffectiveKey()) {
         refreshAccount().catch(() => {});
     }
 
+    function openTab(tabId = 'tracker') {
+        const id = String(tabId || 'tracker');
+        if (id === 'wiki' || id === 'style' || id === 'questions') {
+            activeTab = 'codex';
+            codexSub = id;
+        } else if (id === 'packs') {
+            activeTab = 'forge';
+            forgeSub = 'packs';
+        } else if (id === 'director') {
+            directorExpanded = true;
+            renderDirectorBar();
+            return;
+        } else {
+            activeTab = id;
+            if (id !== 'phone') phoneHighlightIds.clear();
+            if (id === 'codex') codexSub = 'questions';
+            if (id === 'forge') forgeSub = 'forge';
+        }
+        if (activeTab === 'phone' || activeTab === 'codex') {
+            if (activeTab === 'phone') syncCachedCharName();
+            loadLivingWorld().then(changed => { if (changed) renderAll(); }).catch(() => {});
+        }
+        if (activeTab === 'codex' && codexSub === 'style') {
+            recomputeSlop().then(() => renderAll()).catch(() => {});
+        }
+        toggleDrawer(true);
+    }
+
     return {
         renderAll,
-        openTab(tabId = 'tracker') {
-            activeTab = tabId;
-            toggleDrawer(true);
+        openTab,
+        openPhone: () => openTab('phone'),
+        toggleDirector(force) {
+            directorExpanded = typeof force === 'boolean' ? force : !directorExpanded;
+            renderDirectorBar();
         },
         toggleDrawer,
         syncTrackerFromChat,
@@ -3032,6 +3943,12 @@ export function createRpStudioController(bridge) {
         runCharacterForge,
         onAssistantMessageCommitted,
         refreshAccount,
+        reloadLivingWorld,
+        runWikiUpdate,
+        recomputeSlop,
+        revealPhoneEntry,
+        presentPhoneEntry,
+        getPhoneUnseen: () => Number(phoneCache.unseen) || 0,
         getSessionAutoSpendUsd: () => sessionAutoSpendUsd,
         dispose() {
             activeAbort?.abort();

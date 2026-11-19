@@ -1,5 +1,9 @@
 import { activeEntitiesForTarget, getCyclePhase, getVisibleBiologySummary } from './physiology.js';
 
+// Background turn-analysis response budget (v1.3, spec 10.4): critical tracker fields first,
+// then innerThought / suggestedActions, phoneEvents last, so truncation never hits the tracker core.
+export const TRACKER_MAX_TOKENS = 1100;
+
 export function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}' } = {}) {
     if (!state?.world) return '';
     const lines = [
@@ -124,7 +128,11 @@ export function buildSystemContext(state, { userName = '{{user}}', charName = '{
     return lines.length > 3 ? lines.join('\n') : '';
 }
 
-export function buildTrackerExtractionMessages(state, recentMessages, { userName = 'User', charName = 'Character' } = {}) {
+export function buildTrackerExtractionMessages(state, recentMessages, {
+    userName = 'User',
+    charName = 'Character',
+    includePhone = false,
+} = {}) {
     const dialogue = recentMessages
         .slice(-4)
         .map(m => `${m.role === 'user' ? userName : charName}: ${String(m.content ?? '').slice(0, 1800)}`)
@@ -178,8 +186,14 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
         '      "eggsHatched": false',
         '    },',
         '    "char": { /* same fields as user */ }',
-        '  }',
+        '  },',
+        `  "innerThought": "", // 1-2 sentences (max 160 chars) of what ${charName} privately thinks but did not say this turn; in the chat language; "" if unclear`,
+        `  "suggestedActions": ["", "", ""]${includePhone ? ',' : ''} // exactly 3 distinct short options (max 90 chars each) for ${userName}'s next action, written as ${userName}'s own action, in the chat language`,
+        ...(includePhone ? [
+            `  "phoneEvents": [] // 0-2 items ONLY if the story gives a natural reason (usually []): { "kind": "note" | "dm" | "feed" | "photo" | "voice", "author": "who wrote it", "text": "max 280 chars, in the chat language", "mediaPrompt": "short English visual/voice brief for photo/voice, else empty" } — ${charName}'s secret notes, messages to other NPCs, or how the world/forum/social feed reacts to ${userName}`,
+        ] : []),
         '}',
+        'innerThought, suggestedActions' + (includePhone ? ' and phoneEvents' : '') + ' are side-channel UI data: never let them alter the tracker fields above.',
     ].filter(Boolean).join('\n');
 
     return [
@@ -188,17 +202,68 @@ export function buildTrackerExtractionMessages(state, recentMessages, { userName
     ];
 }
 
+// Cuts a truncated JSON object back to its last complete top-level member and closes it.
+function promptsSalvageJsonObject(text) {
+    let inString = false;
+    let escaped = false;
+    let depth = 0;
+    let lastSafe = -1;
+    for (let i = 0; i < text.length; i += 1) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') inString = true;
+        else if (ch === '{' || ch === '[') depth += 1;
+        else if (ch === '}' || ch === ']') {
+            depth -= 1;
+            if (depth === 0) return null; // complete object: nothing to salvage
+        } else if (ch === ',' && depth === 1) lastSafe = i;
+    }
+    if (lastSafe === -1) return null;
+    try {
+        const parsed = JSON.parse(`${text.slice(0, lastSafe)}}`);
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+    } catch {
+        return null;
+    }
+}
+
 export function parseTrackerExtraction(rawText) {
     const text = String(rawText ?? '').trim();
     if (!text) throw new Error('Empty tracker extraction response.');
-    const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text);
+    const fenced = /```(?:json)?\s*([\s\S]*?)(?:```|$)/i.exec(text);
     const candidate = fenced ? fenced[1].trim() : text;
     const start = candidate.indexOf('{');
     const end = candidate.lastIndexOf('}');
-    if (start === -1 || end <= start) throw new Error('Tracker response did not contain JSON.');
-    const parsed = JSON.parse(candidate.slice(start, end + 1));
-    if (!parsed || typeof parsed !== 'object') throw new Error('Invalid tracker JSON object.');
-    return parsed;
+    if (start === -1) throw new Error('Tracker response did not contain JSON.');
+    if (end > start) {
+        try {
+            const parsed = JSON.parse(candidate.slice(start, end + 1));
+            if (!parsed || typeof parsed !== 'object') throw new Error('Invalid tracker JSON object.');
+            return parsed;
+        } catch (err) {
+            const salvaged = promptsSalvageJsonObject(candidate.slice(start));
+            if (salvaged) return salvaged;
+            throw err;
+        }
+    }
+    const salvaged = promptsSalvageJsonObject(candidate.slice(start));
+    if (salvaged) return salvaged;
+    throw new Error('Tracker response did not contain JSON.');
+}
+
+// Never throws (spec 10.4): a broken/truncated response yields an empty delta plus the error message,
+// which the caller shows only in manual mode.
+export function parseTrackerExtractionSafe(rawText) {
+    try {
+        return { delta: parseTrackerExtraction(rawText), error: '' };
+    } catch (err) {
+        return { delta: {}, error: String(err?.message || err || 'Tracker parse error') };
+    }
 }
 
 export function buildSceneVisualPromptMessages({

@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.3.0 — 2026-11-19
+
+- **Director & Living World («Режиссёр и Живой мир»)** — adds seven tightly budgeted living-world modules with **0 extra API calls per turn** (aside from the optional periodic wiki refresh) and a strict **≤ 250-token** prompt cap enforced by `ctxPack`:
+  - **One-Turn Director Strip (`M1`)**: collapsible strip docked above the composer (`🎬 Director`). Select up to 2 short English directives (`suspense`, `twist`, `dialogue`, `slow`, `npc_pov`, `sensory`, plus up to 8 custom pack presets) and/or a 140-char note. Injected at depth 0, preserved across network errors and swipes, and cleared only in `onAssistantMessageCommitted`.
+  - **Local Anti-Slop Radar (`M2`, Codex → Style)**: zero-cost local n-gram (2–5 word) + ~120-phrase RU/EN dictionary scanner over the last 20 character replies with stop-word boundary filtering, subsumption, and character/user name exclusion. Supports `off` / `highlight` / `inject` modes and emits a concise positive style rule (`≤ 6` phrases, `≤ 60` tokens).
+  - **Hidden Thoughts & 3 Action Buttons (`M3`)**: parsed inside the existing background turn extraction (`TRACKER_MAX_TOKENS = 1100`) and rendered strictly under the latest character message (`tavo/ui/turn.html` in Tavo, `.mes` container in SillyTavern). Never injected into the role-play prompt; clicking a suggestion appends it to the composer without sending.
+  - **Smartphone / Diary & World Feed (`M4`, `📱` in drawer header)**: optional `phoneEvents` (max once every 3 turns via `turnsSinceLastPhone`) stored in an append-only chat journal (`clodex_rp_phone`, ≤ 120 entries / ≤ 48 KB). Features *Notes & DMs*, *World feed*, and *Photos & voice*, auto/manual **Smartphone** vs. **Grimoire / letters** skins, *Present next turn* (`pendingMemoryHint`), and strict **Click-to-Reveal** media generation (`confirmPaid` + `maxAutoSpendUsd`, vitals-aware voice tags).
+  - **Living Session Wiki (`M5`, Codex → Wiki)**: *NPCs*, *Quests & threads*, *Places*, and *Timeline* stored in an append-only patch journal (`clodex_rp_wiki`, ≤ 48 KB). Refreshes roughly once every N turns (configurable 4–20, default 8) with stale `targetTurnKey` race rejection, `pinned` protection for manually edited rows, and stem-matched context injection (`≤ 120` tokens via `tnStem`).
+  - **Branch-Safe State & Journals (`M6`)**: unified `turnKey` format (`${id}:${variant}` / ST `${index}:${swipe_id}#${hash(send_date)}`), diff-encoded compact snapshots (`≤ 2.5 KB` target with 6 companions + 8 meters), `restoreCheckpointExact` for `A → B → A` swipes preserving `world.director`, `pendingMemoryHint`, and `codexHistory`, and GC on `message:deleted` / `MESSAGE_DELETED`.
+  - **Data-Only `.clodex-pack` Presets (`M7`, `⚒️ → Packs`)**: export/import shareable JSON preset bundles (`meterPacks`, `directorPresets`, `slopPhrases`, `phoneSkin`, `codexPresets`) up to 64 KB with import preview and strict sanitization (rejects `<script>`, strips HTML/secrets/unknown fields).
+- **UI, Manifest & Platform Polish**:
+  - Header quick-bar `📱 (unseen) · ⚒️ · 🔑 · ⌖ · ✕`, Codex sub-tabs `Questions | Wiki | Style`, single-row 4-tab bar preserved for `390×844` screens, HUD pill capped at `≤ 4` priority chips, SillyTavern slash commands (`/clodex-phone`, `/clodex-wiki`, `/clodex-director`), Tavo sidebar action `open-phone`, and bundler top-level collision gate in `scripts/check.mjs`.
+
 ## 1.2.0 — 2026-11-18
 
 - **Cradle & Familiar («Колыбель и Фамильяр») — Multimodal RP Companion & Dynasty System**:

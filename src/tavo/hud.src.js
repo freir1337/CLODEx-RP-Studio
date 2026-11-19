@@ -1,11 +1,79 @@
 /* global tavo */
 import { blobToBase64, validateKey } from '../core/api.js';
 import { createRpStudioController } from '../core/hud.js';
+import { PACK_MAX_BYTES } from '../core/pack.js';
 import { createChatState, normalizeChatState } from '../core/physiology.js';
+import { tavoIsCharacterRole, tavoMessageTurnKey } from './turnkey.js';
 
 (async function bootstrapTavoHud() {
     const CHAT_VAR_KEY = 'clodex_rp_state';
     const GLOBAL_PREFS_KEY = 'clodex_rp_prefs';
+    const STORE_NAMES = new Set(['clodex_rp_phone', 'clodex_rp_wiki']);
+
+    function configFlag(key, fallback = true) {
+        const val = tavo.plugin.config.get(key);
+        if (val === undefined || val === null) return fallback;
+        return val !== false;
+    }
+
+    function configNumber(key, fallback, min, max) {
+        const num = Number(tavo.plugin.config.get(key));
+        if (!Number.isFinite(num)) return fallback;
+        return Math.max(min, Math.min(max, Math.round(num)));
+    }
+
+    async function findMessages(range) {
+        if (typeof tavo.message?.find !== 'function') return [];
+        const list = await tavo.message.find(range, { hidden: false }).catch(() => []);
+        return Array.isArray(list) ? list : [];
+    }
+
+    function turnExtrasSig(state) {
+        try {
+            return JSON.stringify(state?.turnExtras ?? null);
+        } catch {
+            return '';
+        }
+    }
+
+    function pickJsonFileText({ accept = '.clodex-pack,.json,application/json', maxBytes = PACK_MAX_BYTES } = {}) {
+        return new Promise((resolvePick, rejectPick) => {
+            if (typeof document.createElement !== 'function') {
+                resolvePick(null);
+                return;
+            }
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = accept;
+            input.style.display = 'none';
+            let settled = false;
+            const finish = (fn, value) => {
+                if (settled) return;
+                settled = true;
+                input.remove?.();
+                fn(value);
+            };
+            input.addEventListener('cancel', () => finish(resolvePick, null));
+            input.addEventListener('change', async () => {
+                const file = input.files?.[0];
+                if (!file) {
+                    finish(resolvePick, null);
+                    return;
+                }
+                if (Number(file.size) > maxBytes) {
+                    finish(rejectPick, new Error(`Pack file is larger than ${maxBytes} bytes.`));
+                    return;
+                }
+                try {
+                    finish(resolvePick, await file.text());
+                } catch (err) {
+                    finish(rejectPick, err);
+                }
+            });
+            (document.body || mountContainer).append?.(input);
+            input.click?.();
+        });
+    }
 
     function normalizeMaxAutoSpend(val) {
         if (val === undefined || val === null || val === '') return 0.25;
@@ -36,7 +104,21 @@ import { createChatState, normalizeChatState } from '../core/physiology.js';
         autoImageEvery: 0,
         bgDim: Number(tavo.plugin.config.get('bgDim') ?? 35),
         hudPos: null,
+        slopMode: 'inject',
+        slopDisabled: [],
+        slopPhrases: [],
+        directorPresets: [],
+        meterPacks: [],
+        codexPresets: [],
+        directorExpanded: false,
+        wikiEnabled: configFlag('wikiEnabled', true),
+        wikiEvery: configNumber('wikiEvery', 8, 4, 20),
+        phoneSkin: 'auto',
+        showInnerThoughts: configFlag('showInnerThoughts', true),
+        showSuggestedActions: configFlag('showSuggestedActions', true),
+        thoughtsBlurred: configFlag('thoughtsBlurred', true),
     };
+    let lastTurnExtrasSig = '';
 
     async function reloadFromTavo() {
         const [rawState, rawPrefs] = await Promise.all([
@@ -50,6 +132,7 @@ import { createChatState, normalizeChatState } from '../core/physiology.js';
             cachedState.world.enableVitals = tavo.plugin.config.get('enableVitals') !== false;
             cachedState.world.enableAdultBiology = Boolean(tavo.plugin.config.get('enableAdultBio'));
         }
+        lastTurnExtrasSig = turnExtrasSig(cachedState);
         if (rawPrefs && typeof rawPrefs === 'object') {
             cachedPrefs = {
                 ...cachedPrefs,
@@ -79,6 +162,7 @@ import { createChatState, normalizeChatState } from '../core/physiology.js';
         },
         getSettings: () => cachedPrefs,
         async updateSettings(patch) {
+            let turnPrefChanged = false;
             for (const [k, v] of Object.entries(patch)) {
                 if (k === 'apiKey') {
                     cachedPrefs.apiKey = v ? validateKey(v) : '';
@@ -86,19 +170,79 @@ import { createChatState, normalizeChatState } from '../core/physiology.js';
                     cachedPrefs.maxAutoSpendUsd = normalizeMaxAutoSpend(v);
                 } else {
                     cachedPrefs[k] = v;
+                    if (k === 'showInnerThoughts' || k === 'showSuggestedActions' || k === 'thoughtsBlurred') {
+                        turnPrefChanged = true;
+                    }
                 }
             }
             await tavo.variable.set(GLOBAL_PREFS_KEY, cachedPrefs, 'global');
+            if (turnPrefChanged) {
+                tavo.plugin.emit?.('clodex-turn-extras', { reason: 'prefs' });
+            }
         },
         getChatState: () => cachedState,
         async saveChatState(nextState) {
             cachedState = normalizeChatState(nextState);
             await tavo.variable.set(CHAT_VAR_KEY, cachedState);
+            const sig = turnExtrasSig(cachedState);
+            if (sig !== lastTurnExtrasSig) {
+                lastTurnExtrasSig = sig;
+                // Wakes the per-message ui/turn.html fragment (M3).
+                tavo.plugin.emit?.('clodex-turn-extras', { turnKey: String(cachedState.turnExtras?.turnKey ?? '') });
+            }
         },
-        async getRpContext() {
+        async getActiveTurnKeys() {
+            const all = await findMessages([0, -1]);
+            return all.map(tavoMessageTurnKey).filter(Boolean);
+        },
+        async getLatestTurnKey() {
+            const recent = await findMessages([-6, -1]);
+            for (let i = recent.length - 1; i >= 0; i -= 1) {
+                if (tavoIsCharacterRole(recent[i]?.role)) return tavoMessageTurnKey(recent[i]);
+            }
+            return '';
+        },
+        async loadStore(name) {
+            if (!STORE_NAMES.has(name)) throw new Error(`Unknown store: ${name}`);
+            const raw = await tavo.variable.get(name).catch(() => null);
+            return raw && typeof raw === 'object' ? raw : null;
+        },
+        async saveStore(name, value) {
+            if (!STORE_NAMES.has(name)) throw new Error(`Unknown store: ${name}`);
+            await tavo.variable.set(name, value);
+        },
+        async savePhoneMedia({ entryId, kind = 'photo', blob, base64 } = {}) {
+            const safeId = String(entryId || 'entry').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'entry';
+            const ext = kind === 'voice' || kind === 'audio' ? 'mp3' : 'png';
+            let rawB64 = typeof base64 === 'string' && base64.trim()
+                ? base64.replace(/^data:[^;]+;base64,/, '').trim()
+                : '';
+            if (!rawB64 && blob) rawB64 = await blobToBase64(blob);
+            if (!rawB64) throw new Error('Phone media payload is empty.');
+            return await tavo.file.save(`clodex-phone-${safeId}.${ext}`, rawB64, { encoding: 'base64', scope: 'chat' });
+        },
+        async exportPack(pack) {
+            const json = JSON.stringify(pack, null, 2);
+            const blob = new Blob([json], { type: 'application/json' });
+            if (blob.size > PACK_MAX_BYTES) throw new Error(`Pack is larger than ${PACK_MAX_BYTES} bytes.`);
+            const base = String(pack?.name || 'clodex').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'clodex';
+            await tavo.file.export(`${base}.clodex-pack`, await blobToBase64(blob), { encoding: 'base64' });
+        },
+        async importPack() {
+            const text = await pickJsonFileText();
+            if (text === null || text === undefined) return null;
+            const rawText = String(text);
+            const byteLen = typeof Blob === 'function' ? new Blob([rawText]).size : rawText.length;
+            if (byteLen > PACK_MAX_BYTES) {
+                throw new Error(`Pack file is larger than ${PACK_MAX_BYTES} bytes.`);
+            }
+            return JSON.parse(rawText.replace(/^\uFEFF/, ''));
+        },
+        async getRpContext({ limit = 6 } = {}) {
+            const take = Math.max(1, Math.min(80, Math.trunc(Number(limit) || 6)));
             const [chat, recent] = await Promise.all([
                 tavo.chat.current().catch(() => null),
-                tavo.message.find([-6, -1], { hidden: false }).catch(() => []),
+                findMessages([-take, -1]),
             ]);
             const charSummary = chat?.characters?.[0];
             let charDetail = null;
@@ -251,8 +395,11 @@ import { createChatState, normalizeChatState } from '../core/physiology.js';
         else if (action === 'open-cradle') controller.openTab('cradle');
         else if (action === 'open-codex') controller.openTab('codex');
         else if (action === 'open-forge') controller.openTab('forge');
+        else if (action === 'open-phone') controller.openTab('phone');
+        else if (action === 'open-wiki') controller.openTab('wiki');
+        else if (action === 'open-director') controller.openTab('director');
         else if (action === 'sync-tracker') {
-            await controller.syncTrackerFromChat({ checkpointKey: payload?.messageId || '' });
+            await controller.syncTrackerFromChat({ checkpointKey: payload?.turnKey || payload?.messageId || '' });
         } else if (action === 'generate-bg') {
             await controller.generateSceneBackground({ auto: false });
         } else if (action === 'speak-reply') {
@@ -261,11 +408,12 @@ import { createChatState, normalizeChatState } from '../core/physiology.js';
     });
 
     tavo.plugin.on('clodex-assistant-turn', async payload => {
-        await controller.onAssistantMessageCommitted({ checkpointKey: payload?.messageId || '' });
+        await controller.onAssistantMessageCommitted({ checkpointKey: payload?.turnKey || payload?.messageId || '' });
     });
 
     tavo.plugin.on('clodex-state-updated', async () => {
         await reloadFromTavo();
+        await controller.reloadLivingWorld?.();
         controller.renderAll();
     });
 })();

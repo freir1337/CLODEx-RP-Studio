@@ -5,6 +5,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { findBundleCollisions, resolveBundleFiles, TAVO_BUNDLES } from './bundles.mjs';
 
 const root = fileURLToPath(new URL('../', import.meta.url));
 
@@ -75,7 +76,15 @@ const stRu = JSON.parse(await readFile(resolve(root, 'i18n/ru-ru.json'), 'utf8')
 assert.deepEqual(Object.keys(stEn).sort(), Object.keys(stRu).sort(), 'SillyTavern EN/RU keys must match');
 assert.ok(Object.keys(stEn).every(k => k.startsWith('clodex_rp.')), 'ST keys must be namespaced with clodex_rp.');
 
-const hudSource = await readFile(resolve(root, 'src/core/hud.js'), 'utf8');
+const uiSourceFiles = ['src/core/hud.js', 'src/tavo/turn.src.js'];
+try {
+    for (const entry of await readdir(resolve(root, 'src/core/views'))) {
+        if (entry.endsWith('.js')) uiSourceFiles.push(`src/core/views/${entry}`);
+    }
+} catch {
+    // views directory is optional
+}
+const hudSource = (await Promise.all(uiSourceFiles.map(rel => readFile(resolve(root, rel), 'utf8')))).join('\n');
 const settingsHtml = await readFile(resolve(root, 'settings.html'), 'utf8');
 const literalKeys = [
     ...[...hudSource.matchAll(/\bt\('([a-zA-Z0-9_.]+)'/g)].map(m => m[1]),
@@ -107,6 +116,40 @@ assert.ok(
     (tavoManifest.contributes.sidebar ?? []).some(item => item.id === 'open-cradle'),
     'Tavo manifest must declare open-cradle sidebar action',
 );
+assert.ok(
+    (tavoManifest.contributes.sidebar ?? []).some(item => item.id === 'open-phone' && item.label?.$t === 'actions.openPhone'),
+    'Tavo manifest must declare open-phone sidebar action labelled actions.openPhone',
+);
+assert.ok(tavoManifest.releaseNotes?.$t === `releaseNotes.${pkg.version.replace(/\./g, '_')}`,
+    `Tavo releaseNotes must reference releaseNotes.${pkg.version.replace(/\./g, '_')}`);
+
+// htmlFragments: unique ids, existing files, script tags must point at packaged bundles
+const REQUIRED_FRAGMENTS = [
+    { src: 'ui/hud.html', mount: '/chat/body/end', script: 'ui/hud.js' },
+    { src: 'ui/turn.html', mount: '/messages/end?role=character&position=last', script: 'ui/turn.js' },
+];
+const fragments = tavoManifest.contributes.htmlFragments ?? [];
+assert.equal(new Set(fragments.map(f => f.id)).size, fragments.length, 'htmlFragments ids must be unique');
+for (const frag of fragments) {
+    assert.match(frag.id, /^[a-z0-9-]+$/, `htmlFragment id ${frag.id} invalid`);
+    assert.ok(/^ui\/[a-z0-9_-]+\.html$/.test(frag.src), `htmlFragment ${frag.id} src must be ui/<name>.html`);
+    assert.ok(typeof frag.mount === 'string' && frag.mount.startsWith('/'), `htmlFragment ${frag.id} mount must be a route`);
+}
+for (const req of REQUIRED_FRAGMENTS) {
+    const frag = fragments.find(f => f.src === req.src);
+    assert.ok(frag, `Tavo manifest must declare htmlFragment ${req.src}`);
+    assert.equal(frag.mount, req.mount, `${req.src} must mount on ${req.mount}`);
+    const html = await readFile(resolve(root, 'tavo', req.src), 'utf8');
+    assert.ok(html.includes(`/plugins/${tavoManifest.id}/${req.script}`), `${req.src} must load /plugins/${tavoManifest.id}/${req.script}`);
+    assert.ok(!/\son\w+\s*=/i.test(html), `${req.src} must not use inline event handlers`);
+    const scriptSrcs = [...html.matchAll(/<script\b[^>]*\bsrc="([^"]+)"/g)].map(m => m[1]);
+    const inlineScripts = [...html.matchAll(/<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/g)].filter(m => m[1].trim());
+    assert.equal(inlineScripts.length, 0, `${req.src} must not contain inline scripts`);
+    for (const src of scriptSrcs) {
+        const relPath = src.replace(`/plugins/${tavoManifest.id}/`, '');
+        await readFile(resolve(root, 'tavo', relPath));
+    }
+}
 
 for (const [lang, catalog] of [['en', tavoEn], ['ru', tavoRu]]) {
     const resolveRef = val => (val && typeof val === 'object' && '$t' in val ? catalog[val.$t] : val);
@@ -134,8 +177,24 @@ for (const [lang, catalog] of [['en', tavoEn], ['ru', tavoRu]]) {
     }
 }
 
+// Bundler collision gate (spec 10.8): top-level names (function, async function,
+// class, const, let, var) must be unique across every file flattened into a bundle.
+for (const { out, entry } of TAVO_BUNDLES) {
+    const files = await resolveBundleFiles(root, entry);
+    const collisions = await findBundleCollisions(root, files);
+    assert.equal(
+        collisions.length,
+        0,
+        `Top-level name collisions in ${out}:\n${collisions.map(c => `  ${c.name}: ${c.files.join(' & ')}`).join('\n')}`,
+    );
+    const code = await readFile(resolve(root, out), 'utf8');
+    for (const rel of files) {
+        assert.ok(code.includes(`// --- ${rel} ---`), `${out} is stale: missing ${rel} (run npm run package)`);
+    }
+}
+
 // Verify Tavo classic JS bundles have NO ESM syntax, NO window.tavo/globalThis.tavo, NO navigator.language
-for (const rel of ['tavo/entry.js', 'tavo/ui/hud.js']) {
+for (const { out: rel } of TAVO_BUNDLES) {
     const code = await readFile(resolve(root, rel), 'utf8');
     new vm.Script(code, { filename: rel });
     assert.ok(!/^\s*(import|export)\s/m.test(code), `${rel} must not contain ES module syntax`);
@@ -154,11 +213,18 @@ const tpgEntries = readZipEntries(tpgBuf);
 assert.ok(tpgEntries.includes('manifest.json'), '.tpg must contain manifest.json at archive root');
 assert.ok(tpgEntries.includes('entry.js'), '.tpg must contain entry.js at archive root');
 assert.ok(tpgEntries.includes('ui/hud.html') && tpgEntries.includes('ui/hud.js'), '.tpg must contain HUD fragment');
+assert.ok(tpgEntries.includes('ui/turn.html') && tpgEntries.includes('ui/turn.js'), '.tpg must contain turn fragment');
+for (const frag of tavoManifest.contributes.htmlFragments ?? []) {
+    assert.ok(tpgEntries.includes(frag.src), `.tpg must contain ${frag.src}`);
+}
 assert.ok(tpgEntries.every(e => !e.includes('\\') && !e.startsWith('/') && !e.includes('..')), '.tpg paths must be clean');
 
 const zipBuf = await readFile(resolve(root, 'dist', `CLODEx-RP-Studio-SillyTavern-${pkg.version}.zip`));
 const zipEntries = readZipEntries(zipBuf);
 assert.ok(zipEntries.includes('CLODEx-RP-Studio/manifest.json'), 'ST zip must include CLODEx-RP-Studio/manifest.json');
 assert.ok(zipEntries.includes('CLODEx-RP-Studio/src/core/companion.js'), 'ST zip must include CLODEx-RP-Studio/src/core/companion.js');
+for (const rel of await resolveBundleFiles(root, 'src/st/adapter.js')) {
+    assert.ok(zipEntries.includes(`CLODEx-RP-Studio/${rel}`), `ST zip must include every adapter dependency: ${rel}`);
+}
 
 console.log(`Audit OK: ${jsFiles.length} JS files, ${Object.keys(tavoEn).length} RU/EN keys, Tavo Manifest v2 (.tpg) & SillyTavern (.zip) verified.`);

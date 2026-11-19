@@ -2,12 +2,12 @@
   "specVersion": 2,
   "id": "xyz.clodex.rp-studio",
   "name": { "$t": "plugin.name" },
-  "version": "1.2.0",
+  "version": "1.3.0",
   "minAppVersion": "0.93.0",
   "entry": "entry.js",
   "author": "CLODEx",
   "description": { "$t": "plugin.description" },
-  "releaseNotes": { "$t": "releaseNotes.1_2_0" },
+  "releaseNotes": { "$t": "releaseNotes.1_3_0" },
   "localization": {
     "defaultLocale": "en",
     "resources": {
@@ -47,6 +47,10 @@
         "label": { "$t": "actions.openCradle" }
       },
       {
+        "id": "open-phone",
+        "label": { "$t": "actions.openPhone" }
+      },
+      {
         "id": "open-forge",
         "label": { "$t": "actions.openForge" }
       },
@@ -78,6 +82,11 @@
         "id": "clodex-rp-hud",
         "src": "ui/hud.html",
         "mount": "/chat/body/end"
+      },
+      {
+        "id": "clodex-rp-turn",
+        "src": "ui/turn.html",
+        "mount": "/messages/end?role=character&position=last"
       }
     ],
     "settings": {
@@ -144,6 +153,46 @@
           "max": 80,
           "step": 5,
           "default": 35
+        },
+        {
+          "type": "header",
+          "label": { "$t": "settings.header.v13" }
+        },
+        {
+          "key": "showInnerThoughts",
+          "type": "switch",
+          "label": { "$t": "settings.showInnerThoughts.label" },
+          "default": true
+        },
+        {
+          "key": "thoughtsBlurred",
+          "type": "switch",
+          "label": { "$t": "settings.thoughtsBlurred.label" },
+          "description": { "$t": "settings.thoughtsBlurred.desc" },
+          "default": true
+        },
+        {
+          "key": "showSuggestedActions",
+          "type": "switch",
+          "label": { "$t": "settings.showSuggestedActions.label" },
+          "default": true
+        },
+        {
+          "key": "wikiEnabled",
+          "type": "switch",
+          "label": { "$t": "settings.wikiEnabled.label" },
+          "description": { "$t": "settings.wikiEnabled.desc" },
+          "default": true
+        },
+        {
+          "key": "wikiEvery",
+          "type": "slider",
+          "label": { "$t": "settings.wikiEvery.label" },
+          "description": { "$t": "settings.wikiEvery.desc" },
+          "min": 4,
+          "max": 20,
+          "step": 1,
+          "default": 8
         }
       ]
     }

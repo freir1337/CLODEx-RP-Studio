@@ -1,4 +1,4 @@
-import { advanceCompanionsDays, normalizeCompanion } from './companion.js';
+import { advanceCompanionsDays, COMPANION_ARCHETYPES, createCompanionFromArchetype, normalizeCompanion } from './companion.js';
 import { addDaysToIso, diffDaysForward, parseIsoDate, TIME_SLOTS } from './date.js';
 
 export const BIO_MODES = Object.freeze(['none', 'cycle', 'omegaverse', 'oviposition']);
@@ -63,6 +63,50 @@ export function applyMeterPresetPack(state, packId, locale = 'ru') {
 }
 
 const clamp = (val, min, max) => Math.min(max, Math.max(min, Number.isFinite(val) ? val : min));
+
+export const PHYS_PHONE_EVERY = 3;
+export const PHYS_CHECKPOINT_LIMIT = 25;
+export const PHYS_STATE_MAX_BYTES = 65536;     // clodex_rp_state target incl. all snapshots (spec §1)
+const PHYS_CHECKPOINT_MIN_BUDGET = 16000;
+const PHYS_CHECKPOINT_MAX_BUDGET = 60000;
+const PHYS_SNAPSHOT_LOG_TAIL = 6;
+const PHYS_DIRECTOR_MAX_ACTIVE = 2;
+const PHYS_DIRECTOR_NOTE_MAX = 140;
+const PHYS_THOUGHT_MAX = 160;
+const PHYS_ACTION_MAX = 90;
+const PHYS_KEY_MAX = 200;
+
+function physCleanLine(value, max) {
+    return String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, max);
+}
+
+function physCounter(value, fallback) {
+    const n = Math.trunc(Number(value));
+    return Number.isFinite(n) ? Math.min(9999, Math.max(0, n)) : fallback;
+}
+
+export function normalizeDirectorState(raw) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const ids = [];
+    for (const item of Array.isArray(src.activeIds) ? src.activeIds : []) {
+        const id = String(item ?? '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 40);
+        if (id && !ids.includes(id)) ids.push(id);
+        if (ids.length >= PHYS_DIRECTOR_MAX_ACTIVE) break;
+    }
+    return { activeIds: ids, customNote: physCleanLine(src.customNote, PHYS_DIRECTOR_NOTE_MAX) };
+}
+
+export function normalizeTurnExtras(raw) {
+    const src = raw && typeof raw === 'object' ? raw : {};
+    const actions = Array.isArray(src.suggestedActions)
+        ? src.suggestedActions.map(a => physCleanLine(a, PHYS_ACTION_MAX)).filter(Boolean).slice(0, 3)
+        : [];
+    return {
+        turnKey: String(src.turnKey ?? src.messageKey ?? '').slice(0, PHYS_KEY_MAX),
+        innerThought: physCleanLine(src.innerThought, PHYS_THOUGHT_MAX),
+        suggestedActions: actions,
+    };
+}
 
 export function defaultRng() {
     if (globalThis.crypto?.getRandomValues) {
@@ -145,7 +189,12 @@ export function createChatState(initialDate = '2026-09-01') {
             disclosureMode: 'modern', // modern | medieval | omniscient
             targetMode: 'both',       // char | user | both
             pendingMemoryHint: '',
+            director: { activeIds: [], customNote: '' }, // M1: one-turn director modifiers (survive swipes/restores)
+            slopRule: '',             // M2: recomputed after every answer (derived cache, not snapshotted)
         },
+        turnExtras: { turnKey: '', innerThought: '', suggestedActions: [] }, // M3: latest turn only, never sent to RP model
+        counters: { turnsSinceLastPhone: PHYS_PHONE_EVERY, turnsSinceWiki: 0 },
+        checkpointHead: '', // key of the checkpoint the live state currently derives from (parent of the next one)
         entities: {
             user: createEntityState('user'),
             char: createEntityState('char'),
@@ -187,7 +236,15 @@ export function normalizeChatState(raw) {
         out.world.disclosureMode = DISCLOSURE_MODES.includes(raw.world.disclosureMode) ? raw.world.disclosureMode : 'modern';
         out.world.targetMode = ['char', 'user', 'both'].includes(raw.world.targetMode) ? raw.world.targetMode : 'both';
         out.world.pendingMemoryHint = String(raw.world.pendingMemoryHint ?? '').slice(0, 2000);
+        out.world.director = normalizeDirectorState(raw.world.director);
+        out.world.slopRule = String(raw.world.slopRule ?? '').replace(/\s+/g, ' ').trim().slice(0, 600);
     }
+    out.turnExtras = normalizeTurnExtras(raw.turnExtras);
+    if (raw.counters && typeof raw.counters === 'object') {
+        out.counters.turnsSinceLastPhone = physCounter(raw.counters.turnsSinceLastPhone, PHYS_PHONE_EVERY);
+        out.counters.turnsSinceWiki = physCounter(raw.counters.turnsSinceWiki, 0);
+    }
+    out.checkpointHead = String(raw.checkpointHead ?? '').slice(0, PHYS_KEY_MAX);
     for (const key of ['user', 'char']) {
         const src = raw.entities?.[key];
         if (!src || typeof src !== 'object') continue;
@@ -333,8 +390,19 @@ export function normalizeChatState(raw) {
         })).filter(e => e.summary);
     }
     if (Array.isArray(raw.checkpoints)) {
-        out.checkpoints = raw.checkpoints.slice(-25).filter(cp => cp && typeof cp.key === 'string' && cp.snapshot);
+        out.checkpoints = [];
+        for (const cp of raw.checkpoints.slice(-PHYS_CHECKPOINT_LIMIT)) {
+            if (!cp || typeof cp.key !== 'string' || !cp.key || !cp.snapshot || typeof cp.snapshot !== 'object') continue;
+            const entry = {
+                key: cp.key.slice(0, PHYS_KEY_MAX),
+                // Legacy full snapshots (v1.0–v1.2) are migrated to the compact v1.3 encoding once.
+                snapshot: cp.snapshot.z === 2 ? cp.snapshot : physEncodeSnapshot(normalizeChatState(cp.snapshot)),
+            };
+            if (typeof cp.parent === 'string') entry.parent = cp.parent.slice(0, PHYS_KEY_MAX);
+            out.checkpoints.push(entry);
+        }
     }
+    if (out.checkpointHead && !out.checkpoints.some(cp => cp.key === out.checkpointHead)) out.checkpointHead = '';
     return out;
 }
 
@@ -624,27 +692,321 @@ export function advanceSimulationDays(state, deltaDays, { rng = defaultRng } = {
     return state;
 }
 
-export function saveCheckpoint(state, checkpointKey) {
-    if (!checkpointKey) return;
-    const copy = structuredClone(state);
-    delete copy.checkpoints;
-    delete copy.codexHistory;
-    const filtered = state.checkpoints.filter(cp => cp.key !== checkpointKey);
-    filtered.push({ key: String(checkpointKey), snapshot: copy });
-    state.checkpoints = filtered.slice(-25);
+// ---------------------------------------------------------------------------------------------
+// Compact per-variant checkpoints (v1.3, spec M6 / 10.1).
+// A snapshot stores only what differs from defaults ({ z: 2, d, c?, m? }); companions are diffed against
+// their archetype template and story meters against their preset/generic template. Fields that every
+// restore preserves from the live state (codexHistory, world.director, world.pendingMemoryHint) and derived
+// caches (world.slopRule, scene.imagePrompt) are not stored. Each checkpoint remembers its `parent`
+// (the checkpoint the state derived from), so "restore before" follows the active branch, not array order.
+// ---------------------------------------------------------------------------------------------
+
+const PHYS_UNSAFE_KEYS = Object.freeze(['__proto__', 'constructor', 'prototype']);
+
+function physIsPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-export function restoreCheckpointBefore(state, checkpointKey) {
-    const idx = state.checkpoints.findIndex(cp => cp.key === checkpointKey);
-    if (idx <= 0) return false;
-    const target = state.checkpoints[idx - 1];
+function physSame(a, b) {
+    return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function physDiff(base, value) {
+    if (physIsPlainObject(base) && physIsPlainObject(value)) {
+        const out = {};
+        let changed = false;
+        for (const key of Object.keys(value)) {
+            if (PHYS_UNSAFE_KEYS.includes(key)) continue;
+            const d = physDiff(base[key], value[key]);
+            if (d !== undefined) {
+                out[key] = d;
+                changed = true;
+            }
+        }
+        return changed ? out : undefined;
+    }
+    if (value === undefined || physSame(base, value)) return undefined;
+    return structuredClone(value);
+}
+
+function physPatch(base, diff) {
+    if (diff === undefined) return base;
+    if (physIsPlainObject(base) && physIsPlainObject(diff)) {
+        const out = { ...base };
+        for (const key of Object.keys(diff)) {
+            if (PHYS_UNSAFE_KEYS.includes(key)) continue;
+            out[key] = physPatch(base[key], diff[key]);
+        }
+        return out;
+    }
+    return diff;
+}
+
+function physTurnBase(key) {
+    const raw = String(key ?? '');
+    const hash = raw.indexOf('#');
+    const noSalt = hash === -1 ? raw : raw.slice(0, hash);
+    const colon = noSalt.lastIndexOf(':');
+    return colon === -1 ? noSalt : noSalt.slice(0, colon);
+}
+
+function physMeterGeneric(id) {
+    return { id, label: '', icon: '📊', min: 0, max: 100, value: 0, showInHud: false };
+}
+
+function physMeterPresetRef(meter) {
+    for (const [packId, pack] of Object.entries(METER_PRESET_PACKS)) {
+        for (const lang of Object.keys(pack)) {
+            if (pack[lang].some(tpl => tpl.id === meter.id && tpl.label === meter.label)) return `${packId}.${lang}`;
+        }
+    }
+    return '';
+}
+
+function physMeterTemplate(id, ref) {
+    const [packId, lang] = String(ref || '').split('.');
+    const tpl = METER_PRESET_PACKS[packId]?.[lang]?.find(item => item.id === id);
+    return tpl ? { ...tpl } : physMeterGeneric(id);
+}
+
+// variant '' = bare normalized companion; 'ru' / 'en' = freshly created archetype companion in that locale.
+function physCompanionTemplate(entry, idx, variant = '') {
+    const originChildId = String(entry?.originChildId ?? '');
+    if ((variant === 'ru' || variant === 'en') && !originChildId && COMPANION_ARCHETYPES.includes(entry?.archetype)) {
+        const tpl = createCompanionFromArchetype(entry.archetype, { locale: variant });
+        tpl.id = `comp-${idx + 1}`;
+        return tpl;
+    }
+    return normalizeCompanion({ archetype: entry?.archetype, originChildId }, idx);
+}
+
+function physEncodeCompanion(comp, idx) {
+    const localized = !comp?.originChildId && COMPANION_ARCHETYPES.includes(comp?.archetype);
+    let best = null;
+    let bestLen = Infinity;
+    for (const variant of localized ? ['', 'ru', 'en'] : ['']) {
+        const d = physDiff(physCompanionTemplate(comp, idx, variant), comp) || {};
+        d.archetype = comp?.archetype;
+        if (comp?.originChildId) d.originChildId = comp.originChildId;
+        if (variant) d.l = variant;
+        const len = JSON.stringify(d).length;
+        if (len < bestLen) {
+            best = d;
+            bestLen = len;
+        }
+    }
+    return best;
+}
+
+export function physEncodeSnapshot(state) {
+    const src = structuredClone(state && typeof state === 'object' ? state : createChatState());
+    delete src.checkpoints;
+    delete src.checkpointHead;
+    delete src.codexHistory;
+    if (src.world && typeof src.world === 'object') {
+        delete src.world.director;
+        delete src.world.pendingMemoryHint;
+        delete src.world.slopRule;
+    }
+    if (src.scene && typeof src.scene === 'object') delete src.scene.imagePrompt;
+    if (Array.isArray(src.activityLog)) src.activityLog = src.activityLog.slice(-PHYS_SNAPSHOT_LOG_TAIL);
+
+    const companions = Array.isArray(src.companions) ? src.companions : [];
+    const meters = Array.isArray(src.customMeters) ? src.customMeters : [];
+    delete src.companions;
+    delete src.customMeters;
+
+    const base = createChatState();
+    delete base.companions;
+    delete base.customMeters;
+
+    const snapshot = { z: 2, d: physDiff(base, src) || {} };
+    if (companions.length) {
+        snapshot.c = companions.map((comp, idx) => physEncodeCompanion(comp, idx));
+    }
+    if (meters.length) {
+        snapshot.m = meters.map(meter => {
+            const ref = physMeterPresetRef(meter);
+            const d = physDiff(physMeterTemplate(meter.id, ref), meter) || {};
+            d.id = meter.id;
+            if (ref) d.p = ref;
+            return d;
+        });
+    }
+    return snapshot;
+}
+
+export function physDecodeSnapshot(snapshot) {
+    if (!physIsPlainObject(snapshot)) return createChatState();
+    if (snapshot.z !== 2) return normalizeChatState(snapshot);
+    const raw = physPatch(createChatState(), physIsPlainObject(snapshot.d) ? snapshot.d : {});
+    raw.companions = (Array.isArray(snapshot.c) ? snapshot.c : [])
+        .filter(physIsPlainObject)
+        .map((entry, idx) => physPatch(physCompanionTemplate(entry, idx, entry.l), entry));
+    raw.customMeters = (Array.isArray(snapshot.m) ? snapshot.m : [])
+        .filter(physIsPlainObject)
+        .map(entry => physPatch(physMeterTemplate(String(entry.id ?? ''), entry.p), entry));
+    delete raw.checkpoints;
+    return normalizeChatState(raw);
+}
+
+function physUtf8Bytes(value) {
+    const json = JSON.stringify(value) ?? '';
+    let bytes = 0;
+    for (const ch of json) {
+        const code = ch.codePointAt(0);
+        bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    }
+    return bytes;
+}
+
+// Serialized size (UTF-8 bytes) of the compact snapshot that saveCheckpoint would store for `state`.
+export function checkpointSnapshotBytes(state) {
+    return physUtf8Bytes(physEncodeSnapshot(state));
+}
+
+export function saveCheckpoint(state, checkpointKey) {
+    if (!checkpointKey) return;
+    const key = String(checkpointKey).slice(0, PHYS_KEY_MAX);
+    const cps = Array.isArray(state.checkpoints) ? state.checkpoints : [];
+    const existing = cps.find(cp => cp.key === key);
+    const base = physTurnBase(key);
+
+    let parent = '';
+    let head = cps.find(cp => cp.key === state.checkpointHead && cp.key !== key) || null;
+    // A sibling variant of the same turn is never a parent: use the sibling's own parent instead.
+    if (head && physTurnBase(head.key) === base) {
+        head = typeof head.parent === 'string' ? (cps.find(cp => cp.key === head.parent) || null) : null;
+    }
+    if (head) {
+        parent = head.key;
+    } else if (existing && typeof existing.parent === 'string') {
+        parent = existing.parent;
+    } else {
+        for (let i = cps.length - 1; i >= 0; i -= 1) {
+            if (cps[i].key !== key && physTurnBase(cps[i].key) !== base) {
+                parent = cps[i].key;
+                break;
+            }
+        }
+    }
+
+    const filtered = cps.filter(cp => cp.key !== key);
+    filtered.push({ key, parent, snapshot: physEncodeSnapshot(state) });
+    const kept = filtered.slice(-PHYS_CHECKPOINT_LIMIT);
+    // Byte budget for all snapshots so clodex_rp_state stays within 64 KB: whatever the live state leaves
+    // (bounded to 16..60 KB), evicting the oldest snapshots first.
+    const live = { ...state, checkpoints: [] };
+    const budget = Math.min(PHYS_CHECKPOINT_MAX_BUDGET,
+        Math.max(PHYS_CHECKPOINT_MIN_BUDGET, PHYS_STATE_MAX_BYTES - 1024 - physUtf8Bytes(live)));
+    let total = kept.reduce((sum, cp) => sum + physUtf8Bytes(cp) + 1, 0);
+    while (kept.length > 1 && total > budget) {
+        total -= physUtf8Bytes(kept[0]) + 1;
+        kept.shift();
+    }
+    state.checkpoints = kept;
+    state.checkpointHead = key;
+}
+
+function physRestoreInto(state, target, keptCheckpoints) {
+    const preservedDirector = state.world?.director;
+    const preservedHint = state.world?.pendingMemoryHint;
+    const preservedSlop = state.world?.slopRule;
+    const preservedImagePrompt = state.scene?.imagePrompt;
     const preservedCodex = state.codexHistory;
-    const preservedCheckpoints = state.checkpoints.slice(0, idx);
-    const restored = normalizeChatState(target.snapshot);
+    const restored = physDecodeSnapshot(target.snapshot);
     Object.assign(state, restored);
-    state.codexHistory = preservedCodex;
-    state.checkpoints = preservedCheckpoints;
+    if (preservedDirector !== undefined) state.world.director = normalizeDirectorState(preservedDirector);
+    if (preservedHint !== undefined) state.world.pendingMemoryHint = String(preservedHint ?? '');
+    if (preservedSlop !== undefined) state.world.slopRule = String(preservedSlop ?? '');
+    if (preservedImagePrompt !== undefined) state.scene.imagePrompt = String(preservedImagePrompt ?? '');
+    state.codexHistory = Array.isArray(preservedCodex) ? preservedCodex : [];
+    state.checkpoints = keptCheckpoints;
+    state.checkpointHead = target.key;
+}
+
+// Restores the exact snapshot of a variant (swipe back to an existing variant). Keeps all checkpoints.
+export function restoreCheckpointExact(state, turnKey) {
+    const key = String(turnKey ?? '');
+    const cps = Array.isArray(state?.checkpoints) ? state.checkpoints : [];
+    const target = key ? cps.find(cp => cp.key === key) : null;
+    if (!target) return false;
+    physRestoreInto(state, target, cps);
     return true;
+}
+
+// Rolls back to the state before the turn identified by `checkpointKey` (any variant of that turn).
+// Swipe/regenerate: default { prune: false } keeps every variant snapshot so A -> B -> A works.
+// Message deletion: { prune: true } also drops that turn's snapshots and all of their descendants.
+export function restoreCheckpointBefore(state, checkpointKey, { prune = false } = {}) {
+    const key = String(checkpointKey ?? '');
+    const cps = Array.isArray(state?.checkpoints) ? state.checkpoints : [];
+    if (!key || !cps.length) return false;
+    const base = physTurnBase(key);
+    const sameTurn = cp => physTurnBase(cp.key) === base;
+
+    let anchor = cps.find(cp => cp.key === key) || null;
+    if (!anchor) {
+        for (let i = cps.length - 1; i >= 0; i -= 1) {
+            if (sameTurn(cps[i])) {
+                anchor = cps[i];
+                break;
+            }
+        }
+    }
+    if (!anchor) return false;
+
+    let target = null;
+    if (typeof anchor.parent === 'string') {
+        if (!anchor.parent) return false; // first turn of the chat: nothing to roll back to
+        target = cps.find(cp => cp.key === anchor.parent && !sameTurn(cp)) || null;
+    }
+    const firstIdx = cps.findIndex(sameTurn);
+    if (!target) target = firstIdx > 0 ? cps[firstIdx - 1] : null;
+    if (!target) return false;
+
+    let kept = cps;
+    if (prune) {
+        const doomed = new Set(cps.filter(sameTurn).map(cp => cp.key));
+        let grew = true;
+        while (grew) {
+            grew = false;
+            for (const cp of cps) {
+                if (!doomed.has(cp.key) && typeof cp.parent === 'string' && doomed.has(cp.parent)) {
+                    doomed.add(cp.key);
+                    grew = true;
+                }
+            }
+        }
+        cps.forEach((cp, idx) => {
+            if (idx > firstIdx && typeof cp.parent !== 'string') doomed.add(cp.key);
+        });
+        doomed.delete(target.key);
+        kept = cps.filter(cp => !doomed.has(cp.key));
+    }
+    physRestoreInto(state, target, kept);
+    return true;
+}
+
+function physApplyTurnExtras(state, delta, turnKey) {
+    const hasThought = typeof delta.innerThought === 'string' && delta.innerThought.trim();
+    const hasActions = Array.isArray(delta.suggestedActions)
+        && delta.suggestedActions.some(a => typeof a === 'string' && a.trim());
+    if (hasThought || hasActions) {
+        state.turnExtras = normalizeTurnExtras({
+            turnKey,
+            innerThought: hasThought ? delta.innerThought : '',
+            suggestedActions: hasActions ? delta.suggestedActions.filter(a => typeof a === 'string') : [],
+        });
+    }
+    if (!state.counters || typeof state.counters !== 'object') {
+        state.counters = { turnsSinceLastPhone: PHYS_PHONE_EVERY, turnsSinceWiki: 0 };
+    }
+    state.counters.turnsSinceLastPhone = physCounter(state.counters.turnsSinceLastPhone, PHYS_PHONE_EVERY) + 1;
+    state.counters.turnsSinceWiki = physCounter(state.counters.turnsSinceWiki, 0) + 1;
+    if (Array.isArray(delta.phoneEvents) && delta.phoneEvents.some(ev => ev && typeof ev === 'object')) {
+        state.counters.turnsSinceLastPhone = 0;
+    }
 }
 
 export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = defaultRng } = {}) {
@@ -809,6 +1171,9 @@ export function applyTurnExtraction(state, delta, { checkpointKey = '', rng = de
             }
         }
     }
+
+    // M3/M4/M5 bookkeeping: turnExtras (only when present) and counters. Phone/wiki stores are not touched here.
+    physApplyTurnExtras(state, delta, String(checkpointKey || ''));
 
     if (checkpointKey) saveCheckpoint(state, checkpointKey);
     return state;
