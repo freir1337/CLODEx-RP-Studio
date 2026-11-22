@@ -2,7 +2,7 @@ import { activeEntitiesForTarget, getCyclePhase, getVisibleBiologySummary } from
 
 // Background turn-analysis response budget (v1.3, spec 10.4): critical tracker fields first,
 // then innerThought / suggestedActions, phoneEvents last, so truncation never hits the tracker core.
-export const TRACKER_MAX_TOKENS = 1100;
+export const TRACKER_MAX_TOKENS = 5000;
 
 export function buildSystemContext(state, { userName = '{{user}}', charName = '{{char}}' } = {}) {
     if (!state?.world) return '';
