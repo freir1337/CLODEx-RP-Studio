@@ -1,885 +1,689 @@
-// src/st/adapter.js
-import { base64ToBlob, blobToBase64, validateKey } from '../core/api.js';
-import { ctxPack } from '../core/context.js';
-import { dirBuildCue } from '../core/director.js';
-import { createRpStudioController } from '../core/hud.js';
-import { jrTurnKey } from '../core/journal.js';
-import { PACK_MAX_BYTES } from '../core/pack.js';
-import { phoneGc, phoneNormalizeStore } from '../core/phone.js';
-import { createChatState, normalizeChatState, restoreCheckpointBefore, restoreCheckpointExact } from '../core/physiology.js';
-import { buildSystemContext } from '../core/prompts.js';
-import { wikiGc, wikiNormalizeStore, wikiSelectRelevant, wikiView } from '../core/wiki.js';
+/**
+ * SillyTavern Adapter & Bridge for CLODEx RP Studio
+ * Handles ST context, chat storage, Connection Manager profiles, and extension settings UI.
+ */
 
-export const ST_SETTINGS_KEY = 'clodex_rp_studio';
-export const ST_PROMPT_KEY = 'clodex_rp_studio_context';
-export const ST_DEPTH0_PROMPT_KEY = 'clodex_rp_studio_depth0';
-export const ST_STORE_NAMES = Object.freeze(['clodex_rp_phone', 'clodex_rp_wiki']);
-export const ST_CTX_MAX_TOKENS = 250;
-const ST_TURN_CONTAINER_ID = 'clodex-rp-st-turn';
-// setExtensionPrompt(key, value, position, depth): position 1 = IN_CHAT.
-const ST_PROMPT_IN_CHAT = 1;
+export const MODULE_NAME = 'clodex_rp_studio';
+const STORAGE_PREFIX = 'clodex_rp_studio_v1:';
+const SETTINGS_CONTAINER_ID = 'clodex-rp-studio-extension-settings';
 
-function stHashString(text) {
-    // FNV-1a 32-bit, base36 — guards turn keys against index shifts.
-    let h = 0x811c9dc5;
-    const str = String(text ?? '');
-    for (let i = 0; i < str.length; i += 1) {
-        h ^= str.charCodeAt(i);
-        h = Math.imul(h, 0x01000193) >>> 0;
-    }
-    return h.toString(36);
-}
+export const DEFAULT_SETTINGS = {
+    enabled: true,
+    language: 'ru',
 
-// Unified ST turn key (spec 10.1): `${index}:${swipe_id}#${hash(send_date)}`.
-export function stTurnKey(index, msg) {
-    return jrTurnKey(index, Number(msg?.swipe_id ?? 0) || 0, stHashString(msg?.send_date ?? ''));
-}
-
-export function stParseTurnKey(turnKey) {
-    const [bare, salt = ''] = String(turnKey ?? '').split('#');
-    const cut = bare.lastIndexOf(':');
-    const index = Number(cut >= 0 ? bare.slice(0, cut) : bare);
-    const swipe = cut >= 0 ? Number(bare.slice(cut + 1)) : 0;
-    return {
-        index: Number.isInteger(index) ? index : -1,
-        swipe: Number.isFinite(swipe) ? swipe : 0,
-        salt,
-    };
-}
-
-// A journal key is dead when its message is gone, or when the message at that
-// index provably is a different one (send_date hash mismatch). Unknown swipe
-// metadata keeps the key (conservative: never drop a possibly-live variant).
-export function stTurnKeyIsDead(chat, turnKey) {
-    const { index, swipe, salt } = stParseTurnKey(turnKey);
-    if (index < 0) return false;
-    const list = Array.isArray(chat) ? chat : [];
-    if (index >= list.length) return true;
-    const msg = list[index];
-    if (!msg) return true;
-    if (!salt) return false;
-    const isCurrent = swipe === (Number(msg.swipe_id ?? 0) || 0);
-    const sendDate = isCurrent ? msg.send_date : msg.swipe_info?.[swipe]?.send_date;
-    if (sendDate === undefined || sendDate === null) return false;
-    return stHashString(sendDate) !== salt;
-}
-
-export function stActiveTurnKeys(chat) {
-    const out = [];
-    (Array.isArray(chat) ? chat : []).forEach((msg, i) => {
-        if (msg && !msg.is_system) out.push(stTurnKey(i, msg));
-    });
-    return out;
-}
-
-function stCleanStringList(value, maxItems, maxLen) {
-    if (!Array.isArray(value)) return [];
-    const out = [];
-    for (const item of value) {
-        if (typeof item !== 'string') continue;
-        const clean = item.replace(/\s+/g, ' ').trim().slice(0, maxLen);
-        if (clean && !out.includes(clean)) out.push(clean);
-        if (out.length >= maxItems) break;
-    }
-    return out;
-}
-
-function stCleanObjectList(value, maxItems) {
-    if (!Array.isArray(value)) return [];
-    try {
-        return JSON.parse(JSON.stringify(value.filter(v => v && typeof v === 'object' && !Array.isArray(v)).slice(0, maxItems)));
-    } catch {
-        return [];
-    }
-}
-
-// v1.3 settings (director, anti-slop, wiki, phone, hidden thoughts, packs).
-export function stCleanV13Settings(raw = {}) {
-    const every = raw.wikiEvery === undefined || raw.wikiEvery === null || raw.wikiEvery === ''
-        ? NaN
-        : Math.round(Number(raw.wikiEvery));
-    return {
-        slopMode: ['off', 'highlight', 'inject'].includes(raw.slopMode) ? raw.slopMode : 'inject',
-        slopDisabled: stCleanStringList(raw.slopDisabled, 200, 120),
-        slopPhrases: stCleanStringList(raw.slopPhrases, 200, 120),
-        directorPresets: stCleanObjectList(raw.directorPresets, 8),
-        meterPacks: stCleanObjectList(raw.meterPacks, 20),
-        codexPresets: stCleanObjectList(raw.codexPresets, 20),
-        directorExpanded: raw.directorExpanded === true,
-        wikiEnabled: raw.wikiEnabled !== false,
-        wikiEvery: Number.isFinite(every) ? Math.max(4, Math.min(20, every)) : 8,
-        phoneSkin: ['auto', 'smartphone', 'grimoire'].includes(raw.phoneSkin) ? raw.phoneSkin : 'auto',
-        showInnerThoughts: raw.showInnerThoughts !== false,
-        showSuggestedActions: raw.showSuggestedActions !== false,
-        thoughtsBlurred: raw.thoughtsBlurred !== false,
-    };
-}
-
-function normalizeMaxAutoSpend(val) {
-    if (val === undefined || val === null || val === '') return 0.25;
-    const num = Number(val);
-    return Number.isFinite(num) && num >= 0 ? num : 0.25;
-}
-
-export const DEFAULT_ST_SETTINGS = Object.freeze({
-    apiKey: '',
+    // SillyTavern Connection Profiles ('' = Current active SillyTavern API)
     stTextProfileId: '',
     stCodexProfileId: '',
-    imageApiUrl: 'https://api.openai.com/v1',
-    imageApiKey: '',
-    trackerModel: '',
-    codexModel: '',
-    imageModel: '',
-    videoModel: '',
-    speechModel: '',
-    defaultVoice: 'alloy',
-    dialogueOnly: true,
-    autoSpeak: false,
-    voiceMap: {},
-    autoTrack: true,
-    injectContext: true,
-    confirmPaid: true,
-    maxAutoSpendUsd: 0.25,
-    autoImageEvery: 0,
-    bgDim: 35,
-    hudPos: null,
-    ...stCleanV13Settings({}),
-});
 
-export function loadStSettings(context) {
-    const raw = context.extensionSettings?.[ST_SETTINGS_KEY] ?? {};
-    const clean = {
-        apiKey: typeof raw.apiKey === 'string' ? raw.apiKey.trim() : '',
-        stTextProfileId: typeof raw.stTextProfileId === 'string' ? raw.stTextProfileId.trim() : '',
-        stCodexProfileId: typeof raw.stCodexProfileId === 'string' ? raw.stCodexProfileId.trim() : '',
-        imageApiUrl: typeof raw.imageApiUrl === 'string' && raw.imageApiUrl.trim()
-            ? raw.imageApiUrl.trim()
-            : 'https://api.openai.com/v1',
-        imageApiKey: typeof raw.imageApiKey === 'string' ? raw.imageApiKey.trim() : '',
-        trackerModel: typeof raw.trackerModel === 'string' ? raw.trackerModel : '',
-        codexModel: typeof raw.codexModel === 'string' ? raw.codexModel : '',
-        imageModel: typeof raw.imageModel === 'string' ? raw.imageModel : '',
-        videoModel: typeof raw.videoModel === 'string' ? raw.videoModel : '',
-        speechModel: typeof raw.speechModel === 'string' ? raw.speechModel : '',
-        defaultVoice: typeof raw.defaultVoice === 'string' && raw.defaultVoice ? raw.defaultVoice : 'alloy',
-        dialogueOnly: raw.dialogueOnly !== false,
-        autoSpeak: Boolean(raw.autoSpeak),
-        voiceMap: raw.voiceMap && typeof raw.voiceMap === 'object' ? { ...raw.voiceMap } : {},
-        autoTrack: raw.autoTrack !== false,
-        injectContext: raw.injectContext !== false,
-        confirmPaid: raw.confirmPaid !== false,
-        maxAutoSpendUsd: normalizeMaxAutoSpend(raw.maxAutoSpendUsd),
-        autoImageEvery: Math.max(0, Math.min(30, Number(raw.autoImageEvery) || 0)),
-        bgDim: Math.max(0, Math.min(80, Number(raw.bgDim ?? 35))),
-        hudPos: raw.hudPos && Number.isFinite(raw.hudPos.x) && Number.isFinite(raw.hudPos.y)
-            ? { x: raw.hudPos.x, y: raw.hudPos.y } : null,
-        ...stCleanV13Settings(raw),
-    };
-    if (!clean.imageApiKey && clean.apiKey) {
-        clean.imageApiKey = clean.apiKey;
+    // Text Model Overrides (optional, leave empty to use ST preset model)
+    textProvider: 'st_default',
+    textApiUrl: '',
+    textApiKey: '',
+    textModel: '',
+    codexModel: '',
+
+    // Image Generation Settings (Dedicated Custom / OpenAI-compatible / Proxy endpoint)
+    imageApiUrl: '',
+    imageApiKey: '',
+    imageModel: 'dall-e-3',
+
+    // Scene Generation Preferences
+    promptStyle: 'illustrious',
+    appearance: '',
+    sceneStyle: 'After peak intimacy, warm glow',
+    imageRatio: '1:1',
+    imageQuality: 'standard',
+
+    // Companion / Familiar
+    familiarType: 'cat',
+    familiarName: 'Familiar',
+
+    // Automation Toggles
+    autoTrack: true,
+    autoCodex: false,
+    autoImagePrompt: false,
+    customPrompt: '',
+
+    // Theme & Layout
+    customTheme: {
+        bg: '#0c0a0e',
+        text: '#e6d8df',
+        accent: '#d48ca6',
+        border: '#382b34',
+        panel: 'rgba(18, 14, 21, 0.90)',
+    },
+    panelPosition: null,
+    minimizedPosition: null,
+    isMinimized: false,
+};
+
+/**
+ * Safely retrieves SillyTavern context
+ */
+export function getStContext() {
+    try {
+        if (typeof SillyTavern !== 'undefined' && typeof SillyTavern.getContext === 'function') {
+            return SillyTavern.getContext();
+        }
+    } catch (err) {
+        console.warn('[CLODEx-RP-Studio] Failed to get SillyTavern context:', err);
     }
-    if (context.extensionSettings) context.extensionSettings[ST_SETTINGS_KEY] = clean;
-    return clean;
+    return null;
 }
 
-export function getStConnectionProfiles(context) {
-    const out = [];
-    const seen = new Set();
-    const pushProfile = p => {
-        if (!p || typeof p !== 'object') return;
-        const id = String(p.id ?? p.name ?? '').trim();
-        if (!id || seen.has(id)) return;
-        seen.add(id);
-        const name = String(p.name ?? p.id ?? id).trim();
-        const api = String(p.api ?? p.mode ?? '').trim();
-        const model = String(p.model ?? '').trim();
-        const suffix = [api, model].filter(Boolean).join(' · ');
-        out.push({
-            id,
-            name: suffix ? `${name} (${suffix})` : name,
-        });
-    };
+/**
+ * Loads and normalizes extension settings
+ */
+export function getSettings() {
+    const context = getStContext();
+    const extSettings = context?.extensionSettings || window?.extension_settings;
+
+    if (extSettings) {
+        if (!extSettings[MODULE_NAME]) {
+            extSettings[MODULE_NAME] = structuredClone(DEFAULT_SETTINGS);
+        }
+        const current = extSettings[MODULE_NAME];
+        for (const [key, val] of Object.entries(DEFAULT_SETTINGS)) {
+            if (current[key] === undefined) {
+                current[key] = typeof val === 'object' && val !== null ? structuredClone(val) : val;
+            }
+        }
+        if (!current.customTheme || typeof current.customTheme !== 'object') {
+            current.customTheme = structuredClone(DEFAULT_SETTINGS.customTheme);
+        } else {
+            for (const [tKey, tVal] of Object.entries(DEFAULT_SETTINGS.customTheme)) {
+                if (!current.customTheme[tKey]) current.customTheme[tKey] = tVal;
+            }
+        }
+        // Clear legacy default Claude model string if user hasn't explicitly configured custom text API
+        if (current.textModel === 'claude-3-7-sonnet-20250219' && !current.textApiUrl) {
+            current.textModel = '';
+        }
+        return current;
+    }
+
     try {
-        const cmService = context?.ConnectionManagerRequestService;
-        if (typeof cmService?.getSupportedProfiles === 'function') {
-            const list = cmService.getSupportedProfiles();
-            if (Array.isArray(list)) list.forEach(pushProfile);
+        const raw = localStorage.getItem(`${STORAGE_PREFIX}settings`);
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            return {
+                ...structuredClone(DEFAULT_SETTINGS),
+                ...parsed,
+                customTheme: {
+                    ...structuredClone(DEFAULT_SETTINGS.customTheme),
+                    ...(parsed.customTheme || {}),
+                },
+            };
+        }
+    } catch (err) {
+        console.warn('[CLODEx-RP-Studio] Failed reading settings from localStorage:', err);
+    }
+
+    return structuredClone(DEFAULT_SETTINGS);
+}
+
+/**
+ * Saves extension settings
+ */
+export function saveSettings(partial = {}) {
+    const context = getStContext();
+    const current = getSettings();
+
+    Object.assign(current, partial);
+    if (partial.customTheme) {
+        current.customTheme = {
+            ...DEFAULT_SETTINGS.customTheme,
+            ...current.customTheme,
+            ...partial.customTheme,
+        };
+    }
+
+    const extSettings = context?.extensionSettings || window?.extension_settings;
+    if (extSettings) {
+        extSettings[MODULE_NAME] = current;
+    }
+
+    if (typeof context?.saveSettingsDebounced === 'function') {
+        context.saveSettingsDebounced();
+    } else if (typeof window?.saveSettingsDebounced === 'function') {
+        window.saveSettingsDebounced();
+    }
+
+    try {
+        localStorage.setItem(`${STORAGE_PREFIX}settings`, JSON.stringify(current));
+    } catch (err) {
+        console.warn('[CLODEx-RP-Studio] Failed saving settings to localStorage:', err);
+    }
+
+    return current;
+}
+
+/**
+ * Resets extension settings to defaults
+ */
+export function resetSettings() {
+    const fresh = structuredClone(DEFAULT_SETTINGS);
+    return saveSettings(fresh);
+}
+
+/**
+ * Checks if a string looks like HTML page markup rather than chat text
+ */
+function isHtmlLikeString(str) {
+    if (!str || typeof str !== 'string') return false;
+    const trimmed = str.trim();
+    if (/^<!DOCTYPE\s+html/i.test(trimmed) || /^<html[\s>]/i.test(trimmed)) return true;
+    if (/<(head|body|script|style|meta|link)\b/i.test(trimmed)) return true;
+    return false;
+}
+
+/**
+ * Strips raw HTML tags while preserving readable text
+ */
+function sanitizePossibleHtmlText(str) {
+    if (!str || typeof str !== 'string') return '';
+    if (isHtmlLikeString(str)) return '';
+    return str
+        .replace(/<style[\s\S]*?<\/style>/gi, '')
+        .replace(/<script[\s\S]*?<\/script>/gi, '')
+        .trim();
+}
+
+/**
+ * Extracts message text from a SillyTavern chat message entry
+ */
+function extractMessageText(msg) {
+    if (!msg || typeof msg !== 'object') return '';
+    const raw =
+        typeof msg.mes === 'string'
+            ? msg.mes
+            : typeof msg.message === 'string'
+              ? msg.message
+              : typeof msg.content === 'string'
+                ? msg.content
+                : '';
+    return sanitizePossibleHtmlText(raw);
+}
+
+/**
+ * Retrieves normalized recent chat messages from SillyTavern
+ */
+export function getChatMessages(limit = 20) {
+    const context = getStContext();
+    const rawChat = Array.isArray(context?.chat) ? context.chat : [];
+    const results = [];
+
+    for (let i = 0; i < rawChat.length; i++) {
+        const item = rawChat[i];
+        if (!item || item.is_system) continue;
+        const mes = extractMessageText(item);
+        if (!mes) continue;
+
+        results.push({
+            index: i,
+            name: item.name || (item.is_user ? 'User' : 'Character'),
+            is_user: Boolean(item.is_user),
+            mes,
+        });
+    }
+
+    if (limit > 0 && results.length > limit) {
+        return results.slice(-limit);
+    }
+    return results;
+}
+
+/**
+ * Returns active character name
+ */
+export function getActiveCharacterName() {
+    const context = getStContext();
+    if (!context) return '';
+    if (context.name2) return String(context.name2);
+    const charId = context.characterId;
+    if (charId !== undefined && charId !== null && Array.isArray(context.characters)) {
+        return context.characters[charId]?.name || '';
+    }
+    return '';
+}
+
+/**
+ * Returns current character avatar URL if available
+ */
+export function getCurrentCharacterAvatar() {
+    const context = getStContext();
+    if (!context) return '';
+
+    try {
+        const charId = context.characterId;
+        if (charId !== undefined && charId !== null && Array.isArray(context.characters)) {
+            const char = context.characters[charId];
+            if (char?.avatar) {
+                if (typeof context.getThumbnailUrl === 'function') {
+                    return context.getThumbnailUrl('avatar', char.avatar);
+                }
+                return `/characters/${encodeURIComponent(char.avatar)}`;
+            }
         }
     } catch {
-        // Ignore if ConnectionManagerRequestService is unavailable
+        // Fallback to DOM check
     }
-    const rawProfiles = context?.extensionSettings?.connectionManager?.profiles;
-    if (Array.isArray(rawProfiles)) {
-        rawProfiles.forEach(pushProfile);
-    }
-    return out;
+
+    const avatarImg = document.querySelector('#avatar_load_preview, .mes:not([is_user="true"]) .avatar img');
+    if (avatarImg && avatarImg.src) return avatarImg.src;
+    return '';
 }
 
-async function sendTextRequestViaSillyTavern(context, {
+/**
+ * Builds unique chat ID for local state persistence
+ */
+export function getChatId() {
+    const context = getStContext();
+    if (typeof context?.getCurrentChatId === 'function') {
+        const id = context.getCurrentChatId();
+        if (id) return String(id);
+    }
+    if (context?.chatId) return String(context.chatId);
+    const charName = getActiveCharacterName() || 'default_char';
+    const group = context?.groupId ? `group_${context.groupId}` : charName;
+    return `${group}_chat`;
+}
+
+function getStorageKey(chatId = getChatId()) {
+    return `${STORAGE_PREFIX}chat_state:${chatId}`;
+}
+
+export function loadChatState(chatId = getChatId()) {
+    try {
+        const raw = localStorage.getItem(getStorageKey(chatId));
+        if (raw) return JSON.parse(raw);
+    } catch (err) {
+        console.warn('[CLODEx-RP-Studio] Failed loading chat state:', err);
+    }
+    return null;
+}
+
+export function saveChatState(state, chatId = getChatId()) {
+    try {
+        localStorage.setItem(getStorageKey(chatId), JSON.stringify(state));
+        return true;
+    } catch (err) {
+        console.warn('[CLODEx-RP-Studio] Failed saving chat state:', err);
+        return false;
+    }
+}
+
+export function clearChatState(chatId = getChatId()) {
+    try {
+        localStorage.removeItem(getStorageKey(chatId));
+        return true;
+    } catch (err) {
+        console.warn('[CLODEx-RP-Studio] Failed clearing chat state:', err);
+        return false;
+    }
+}
+
+/**
+ * Lists available SillyTavern Connection Manager profiles
+ */
+export function getStProfiles() {
+    const context = getStContext();
+    const profiles =
+        context?.extensionSettings?.connectionManager?.profiles ||
+        window?.extension_settings?.connectionManager?.profiles ||
+        [];
+
+    if (!Array.isArray(profiles)) return [];
+
+    return profiles
+        .filter((p) => p && typeof p === 'object' && p.id)
+        .map((p) => ({
+            id: String(p.id),
+            name: String(p.name || p.id),
+            api: String(p.api || ''),
+            model: String(p.model || ''),
+        }));
+}
+
+/**
+ * Returns default base URL for image generation fallback
+ */
+export function getImageBaseUrl() {
+    const settings = getSettings();
+    if (settings.imageApiUrl && settings.imageApiUrl.trim()) {
+        return settings.imageApiUrl.trim().replace(/\/+$/, '');
+    }
+    return `${window.location.origin}/api/openai/v1`;
+}
+
+/**
+ * Extracts usable text or JSON from any SillyTavern / LLM response structure,
+ * including reasoning fields (reasoning, reasoning_content) when content is empty.
+ */
+function extractTextFromStResponse(res, jsonMode = false) {
+    if (!res) return '';
+    if (typeof res === 'string') return res.trim();
+
+    if (typeof res === 'object') {
+        const directContent =
+            res.content ??
+            res.text ??
+            res.response ??
+            res.message?.content ??
+            res.choices?.[0]?.message?.content ??
+            res.choices?.[0]?.text ??
+            res.data?.content ??
+            '';
+
+        const directReasoning =
+            res.reasoning ??
+            res.reasoning_content ??
+            res.message?.reasoning_content ??
+            res.message?.reasoning ??
+            res.choices?.[0]?.message?.reasoning_content ??
+            res.choices?.[0]?.message?.reasoning ??
+            res.data?.reasoning ??
+            '';
+
+        const contentStr = typeof directContent === 'string' ? directContent.trim() : '';
+        const reasoningStr = typeof directReasoning === 'string' ? directReasoning.trim() : '';
+
+        if (contentStr) {
+            // If jsonMode is requested and content has no JSON braces, but reasoning has JSON braces, combine them
+            if (jsonMode && !contentStr.includes('{') && reasoningStr.includes('{')) {
+                return `${reasoningStr}\n${contentStr}`.trim();
+            }
+            return contentStr;
+        }
+
+        if (reasoningStr) {
+            return reasoningStr;
+        }
+    }
+
+    return '';
+}
+
+/**
+ * Sends a chat/text completion request through SillyTavern's native connection or Connection Manager profile
+ */
+export async function sendTextRequestViaSillyTavern({
     profileId = '',
+    model = '',
     messages = [],
-    maxTokens = 600,
+    temperature = 0.3,
+    maxTokens = 1100,
     jsonMode = false,
 } = {}) {
-    const cleanMessages = (Array.isArray(messages) ? messages : [])
-        .filter(m => m && typeof m.content === 'string' && m.content.trim())
-        .map(m => ({
-            role: m.role === 'system' || m.role === 'assistant' ? m.role : 'user',
-            content: m.content,
-        }));
-
-    if (!cleanMessages.length) {
-        throw new Error('Prompt messages are empty.');
+    const context = getStContext();
+    if (!context) {
+        throw new Error('SillyTavern context is not available.');
     }
 
-    const cmService = context?.ConnectionManagerRequestService;
-    if (profileId && typeof cmService?.sendRequest === 'function') {
-        const response = await cmService.sendRequest(
-            profileId,
-            cleanMessages,
-            maxTokens,
-            {
-                stream: false,
-                extractData: true,
-                includePreset: false,
-                includeInstruct: false,
-            },
-            jsonMode ? { response_format: { type: 'json_object' } } : {},
-        );
-        const text = typeof response === 'string'
-            ? response
-            : String(response?.content ?? response?.text ?? response?.choices?.[0]?.message?.content ?? '');
-        if (text.trim()) return text.trim();
+    const normalizedMessages = (Array.isArray(messages) ? messages : [])
+        .map((m) => ({
+            role: m?.role === 'system' || m?.role === 'assistant' ? m.role : 'user',
+            content: typeof m?.content === 'string' ? m.content.trim() : String(m?.content ?? '').trim(),
+        }))
+        .filter((m) => m.content.length > 0);
+
+    if (!normalizedMessages.length) {
+        throw new Error('No prompt messages provided for generation.');
     }
 
-    // Fallback to currently active SillyTavern API connection
+    // Ensure sufficient token budget so reasoning models (e.g. Boulesis / Gemma / Qwen / DeepSeek)
+    // do not run out of tokens inside <think> / reasoning_content before writing the JSON output.
+    const requestedTokens = Number(maxTokens) || 1100;
+    const safeMaxTokens = jsonMode
+        ? Math.max(requestedTokens, 3200)
+        : Math.max(requestedTokens, 1024);
+
+    const customModel = typeof model === 'string' ? model.trim() : '';
+
+    // 1. If a specific Connection Manager profile is selected, try ConnectionManagerRequestService
+    const cmService = context.ConnectionManagerRequestService || window?.ConnectionManagerRequestService;
+    if (profileId && cmService && typeof cmService.sendRequest === 'function') {
+        const overridePayload = {};
+        if (Number.isFinite(Number(temperature))) {
+            overridePayload.temperature = Number(temperature);
+        }
+        if (customModel) {
+            overridePayload.model = customModel;
+        }
+
+        try {
+            // Try with extractData: false first so we can inspect both content and reasoning_content from raw response
+            const rawResponse = await cmService.sendRequest(
+                profileId,
+                normalizedMessages,
+                safeMaxTokens,
+                {
+                    extractData: false,
+                    includePreset: false,
+                    includeInstruct: false,
+                },
+                overridePayload,
+            );
+            const extracted = extractTextFromStResponse(rawResponse, jsonMode);
+            if (extracted) return extracted;
+        } catch (firstErr) {
+            console.warn('[CLODEx-RP-Studio] ConnectionManager raw request failed, retrying with extractData: true:', firstErr);
+            try {
+                const fallbackResponse = await cmService.sendRequest(
+                    profileId,
+                    normalizedMessages,
+                    safeMaxTokens,
+                    {
+                        extractData: true,
+                        includePreset: false,
+                        includeInstruct: false,
+                    },
+                );
+                const extracted = extractTextFromStResponse(fallbackResponse, jsonMode);
+                if (extracted) return extracted;
+            } catch (secondErr) {
+                console.warn('[CLODEx-RP-Studio] ConnectionManager fallback failed, falling back to default ST generator:', secondErr);
+            }
+        }
+    }
+
+    // Build systemPrompt and userPrompt for SillyTavern's native generation functions
     const systemParts = [];
-    const promptParts = [];
-    for (const msg of cleanMessages) {
+    const conversationParts = [];
+
+    for (const msg of normalizedMessages) {
         if (msg.role === 'system') {
             systemParts.push(msg.content);
+        } else if (msg.role === 'assistant') {
+            conversationParts.push(`Assistant:\n${msg.content}`);
         } else {
-            const prefix = msg.role === 'assistant' ? 'Assistant' : 'User';
-            promptParts.push(`${prefix}:\n${msg.content}`);
+            conversationParts.push(msg.content);
         }
     }
-    const systemPrompt = systemParts.join('\n\n');
-    const userPrompt = promptParts.join('\n\n') || systemPrompt;
 
-    if (typeof context?.generateRaw === 'function') {
+    const systemPrompt = systemParts.join('\n\n').trim();
+    const userPrompt = conversationParts.join('\n\n').trim() || systemPrompt;
+    const effectiveSystemPrompt = conversationParts.length > 0 ? systemPrompt : '';
+
+    // 2. Prefer context.generateRawData (modern ST API that returns { content, reasoning } without throwing on empty content)
+    if (typeof context.generateRawData === 'function') {
         try {
-            const res = await context.generateRaw({
+            const rawData = await context.generateRawData({
                 prompt: userPrompt,
-                systemPrompt: promptParts.length ? systemPrompt : '',
-                responseLength: maxTokens,
+                systemPrompt: effectiveSystemPrompt,
+                responseLength: safeMaxTokens,
                 trimNames: false,
             });
-            const text = String(res ?? '').trim();
-            if (text) return text;
-        } catch {
-            const combined = [systemPrompt, userPrompt].filter(Boolean).join('\n\n');
-            const res = await context.generateRaw(combined, '', false, false, '', maxTokens);
-            const text = String(res ?? '').trim();
-            if (text) return text;
-        }
-    }
-
-    if (typeof context?.generateQuietPrompt === 'function') {
-        const combined = [systemPrompt, userPrompt].filter(Boolean).join('\n\n');
-        const res = await context.generateQuietPrompt({
-            quietPrompt: combined,
-            responseLength: maxTokens,
-        });
-        const text = String(res ?? '').trim();
-        if (text) return text;
-    }
-
-    throw new Error('SillyTavern text generation is unavailable. Configure an API connection or select a Connection Profile.');
-}
-
-async function uploadMediaToSt(context, fetchImpl, blob, ext, prefix = 'clodex-rp') {
-    const base64 = await blobToBase64(blob);
-    const name = `${prefix}-${Date.now()}.${ext}`;
-    try {
-        const headers = new Headers(context.getRequestHeaders?.() ?? {});
-        headers.set('Content-Type', 'application/json');
-        const res = await fetchImpl('/api/files/upload', {
-            method: 'POST',
-            headers,
-            credentials: 'same-origin',
-            body: JSON.stringify({ name, data: base64 }),
-        });
-        if (res.ok) {
-            const payload = await res.json();
-            if (payload?.path) return String(payload.path);
-        }
-    } catch {
-        // Fallback to object URL for standalone/test harnesses
-    }
-    return URL.createObjectURL(blob);
-}
-
-export async function initializeSillyTavern({
-    getContext = () => globalThis.SillyTavern?.getContext(),
-    fetchImpl = globalThis.fetch?.bind(globalThis),
-    document = globalThis.document,
-    confirm = msg => globalThis.confirm(msg),
-} = {}) {
-    if (document.querySelector('#clodex-rp-studio-settings')) return null;
-    const context = getContext();
-    if (!context) throw new Error('SillyTavern context unavailable.');
-
-    const base = new URL('../../', import.meta.url);
-    const [settingsHtml, enJson, ruJson] = await Promise.all([
-        fetchImpl(new URL('settings.html', base)).then(r => r.text()),
-        fetchImpl(new URL('i18n/en-us.json', base)).then(r => r.json()),
-        fetchImpl(new URL('i18n/ru-ru.json', base)).then(r => r.json()),
-    ]);
-
-    const settings = loadStSettings(context);
-    const V13_DEFAULTS = stCleanV13Settings({});
-    let currentChatId = '';
-    let chatState = createChatState();
-
-    const getLocale = () => {
-        const raw = context.getCurrentLocale?.() ?? globalThis.navigator?.language ?? 'en';
-        return String(raw).toLowerCase().startsWith('ru') ? 'ru' : 'en';
-    };
-
-    const t = (key, params = {}) => {
-        const dict = getLocale() === 'ru' ? ruJson : enJson;
-        const raw = dict[`clodex_rp.${key}`] ?? enJson[`clodex_rp.${key}`] ?? key;
-        return String(raw).replace(/\{(\w+)\}/g, (m, k) => String(params[k] ?? m));
-    };
-
-    // Mount settings card in SillyTavern Extensions tab
-    const tpl = document.createElement('template');
-    tpl.innerHTML = settingsHtml;
-    const settingsCard = tpl.content.firstElementChild;
-    for (const node of settingsCard.querySelectorAll('[data-clodex-rp-i18n]')) {
-        node.textContent = t(node.dataset.clodexRpI18n);
-    }
-    document.querySelector('#extensions_settings')?.append(settingsCard);
-
-    let customImageBgEl = document.querySelector('#clodex-rp-st-image-bg');
-    if (!customImageBgEl) {
-        customImageBgEl = document.createElement('div');
-        customImageBgEl.id = 'clodex-rp-st-image-bg';
-        customImageBgEl.style.cssText = 'position:fixed;inset:0;z-index:-1;pointer-events:none;background-size:cover;background-position:center;transition:opacity .35s ease;opacity:0;';
-        document.body.prepend(customImageBgEl);
-    }
-
-    function applyStImageOverlay(path) {
-        if (path) {
-            customImageBgEl.style.backgroundImage = `url("${CSS.escape ? path.replace(/"/g, '\\"') : path}")`;
-            customImageBgEl.style.opacity = '0.45';
-        } else {
-            customImageBgEl.style.backgroundImage = 'none';
-            customImageBgEl.style.opacity = '0';
-        }
-    }
-
-    function loadStateForCurrentChat() {
-        const ctx = getContext();
-        const cid = String(ctx.getCurrentChatId?.() ?? ctx.chatId ?? 'default');
-        currentChatId = cid;
-        const raw = ctx.chatMetadata?.[ST_SETTINGS_KEY];
-        chatState = raw ? normalizeChatState(raw) : createChatState();
-        applyStImageOverlay(chatState.scene.imagePath);
-        pushExtensionPrompt();
-        return chatState;
-    }
-
-    function readStore(name) {
-        const raw = getContext().chatMetadata?.[name];
-        return raw && typeof raw === 'object' ? raw : null;
-    }
-
-    // Single context assembly through ctxPack (spec 10.3): `main` keeps the
-    // existing in-chat slot, `depth0` (director + anti-slop) goes to depth 0.
-    function pushExtensionPrompt() {
-        const ctx = getContext();
-        if (typeof ctx.setExtensionPrompt !== 'function') return;
-        const charObj = ctx.characters?.[ctx.characterId];
-        let packed = { main: '', depth0: '' };
-        try {
-            const director = dirBuildCue(chatState.world?.director, settings.directorPresets);
-            const scene = settings.injectContext
-                ? buildSystemContext(chatState, {
-                    userName: ctx.name1 || '{{user}}',
-                    charName: ctx.name2 || charObj?.name || '{{char}}',
-                })
-                : '';
-            let wiki = '';
-            const wikiRaw = settings.injectContext && settings.wikiEnabled ? readStore('clodex_rp_wiki') : null;
-            if (wikiRaw) {
-                const store = wikiNormalizeStore(wikiRaw);
-                if (Array.isArray(store.journal) && store.journal.length) {
-                    const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
-                    const recentText = chat.filter(m => m && !m.is_system).slice(-2).map(m => String(m.mes ?? '')).join('\n');
-                    wiki = wikiSelectRelevant(wikiView(store, stActiveTurnKeys(chat)), recentText, { maxTokens: 120 }) || '';
+            const extracted = extractTextFromStResponse(rawData, jsonMode);
+            if (extracted) {
+                if (jsonMode && !extracted.includes('{')) {
+                    throw new Error(
+                        `Модель потратила все ${safeMaxTokens} токенов на размышления (<think>) и не успела вывести JSON. Увеличьте лимит токенов или отключите Reasoning.`,
+                    );
                 }
+                return extracted;
             }
-            const slop = settings.slopMode === 'inject' ? String(chatState.world?.slopRule ?? '') : '';
-            packed = ctxPack({ director, scene, wiki, slop, maxTokens: ST_CTX_MAX_TOKENS });
         } catch (err) {
-            globalThis.console?.warn?.('[CLODEx RP Studio] context assembly failed', err);
-        }
-        ctx.setExtensionPrompt(ST_PROMPT_KEY, packed.main || '', ST_PROMPT_IN_CHAT, 1);
-        ctx.setExtensionPrompt(ST_DEPTH0_PROMPT_KEY, packed.depth0 || '', ST_PROMPT_IN_CHAT, 0);
-    }
-
-    // M3: hidden thoughts + action buttons under the latest character `.mes`.
-    function removeTurnExtras() {
-        document.getElementById?.(ST_TURN_CONTAINER_ID)?.remove?.();
-    }
-
-    function renderTurnExtras() {
-        removeTurnExtras();
-        if (typeof document.querySelectorAll !== 'function') return;
-        const extras = chatState.turnExtras;
-        if (!extras || !extras.turnKey) return;
-        const nodes = document.querySelectorAll('#chat .mes');
-        const mesEl = nodes?.length ? nodes[nodes.length - 1] : null;
-        if (!mesEl) return;
-        const ctx = getContext();
-        const index = Number(mesEl.getAttribute?.('mesid'));
-        const msg = Number.isInteger(index) ? ctx.chat?.[index] : null;
-        if (!msg || msg.is_user || msg.is_system) return;
-        if (stTurnKey(index, msg) !== String(extras.turnKey)) return;
-
-        const thought = settings.showInnerThoughts
-            ? String(extras.innerThought ?? '').replace(/\s+/g, ' ').trim().slice(0, 160)
-            : '';
-        const actions = settings.showSuggestedActions && Array.isArray(extras.suggestedActions)
-            ? extras.suggestedActions.map(a => String(a ?? '').replace(/\s+/g, ' ').trim().slice(0, 90)).filter(Boolean).slice(0, 3)
-            : [];
-        if (!thought && !actions.length) return;
-
-        const make = (tag, className, text) => {
-            const node = document.createElement(tag);
-            if (className) node.className = className;
-            if (text) node.textContent = text;
-            return node;
-        };
-        const box = make('div', 'clodex-rp-turn');
-        box.id = ST_TURN_CONTAINER_ID;
-        if (thought) {
-            const details = make('details', 'clodex-rp-turn-thoughts');
-            const charName = String(ctx.name2 || msg.name || '{{char}}').trim().slice(0, 48);
-            const summary = make('summary', '', t('turn.thoughtsTitle', { char: charName }));
-            summary.setAttribute?.('title', t('turn.reveal'));
-            details.append(summary, make('p', 'clodex-rp-turn-thought', thought));
-            details.open = !settings.thoughtsBlurred;
-            box.append(details);
-        }
-        if (actions.length) {
-            const row = make('div', 'clodex-rp-turn-actions');
-            row.append(make('span', 'clodex-rp-turn-actions-title', t('turn.actionsTitle')));
-            for (const action of actions) {
-                const btn = make('button', 'clodex-rp-turn-btn menu_button', action);
-                btn.type = 'button';
-                btn.setAttribute?.('title', t('turn.insertHint'));
-                btn.addEventListener('click', () => {
-                    bridge.insertIntoComposer(action).catch?.(() => {});
-                });
-                row.append(btn);
+            console.warn('[CLODEx-RP-Studio] generateRawData warning:', err);
+            if (String(err?.message || '').includes('потратила все')) {
+                throw err;
             }
-            box.append(row);
         }
-        const textEl = mesEl.querySelector?.('.mes_text');
-        if (textEl?.after) textEl.after(box);
-        else mesEl.append?.(box);
     }
 
-    function downloadBlob(blob, fileName) {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = fileName;
-        document.body.append(a);
-        a.click?.();
-        a.remove?.();
-        setTimeout(() => URL.revokeObjectURL(url), 5_000);
+    // 3. Fallback to context.generateRaw with modern options object ONLY (never pass positional string arguments)
+    if (typeof context.generateRaw === 'function') {
+        const res = await context.generateRaw({
+            prompt: userPrompt,
+            systemPrompt: effectiveSystemPrompt,
+            responseLength: safeMaxTokens,
+            trimNames: false,
+        });
+        const extracted = extractTextFromStResponse(res, jsonMode);
+        if (extracted) return extracted;
+
+        throw new Error(
+            'Модель вернула пустой ответ (все токены ушли в блок размышлений reasoning_content / <think>). Отключите Reasoning или выберите другую модель.',
+        );
     }
 
-    function pickTextFile(accept, maxBytes) {
-        return new Promise((resolvePick, rejectPick) => {
-            const input = document.createElement('input');
-            input.type = 'file';
-            input.accept = accept;
-            input.style.display = 'none';
-            let settled = false;
-            const finish = (fn, value) => {
-                if (settled) return;
-                settled = true;
-                input.remove?.();
-                fn(value);
-            };
-            input.addEventListener('cancel', () => finish(resolvePick, null));
-            input.addEventListener('change', async () => {
-                const file = input.files?.[0];
-                if (!file) return finish(resolvePick, null);
-                if (Number(file.size) > maxBytes) {
-                    return finish(rejectPick, new Error(`Pack file is larger than ${maxBytes} bytes.`));
-                }
-                try {
-                    finish(resolvePick, await file.text());
-                } catch (err) {
-                    finish(rejectPick, err);
-                }
-                return undefined;
-            });
-            document.body.append(input);
-            input.click?.();
+    // 4. Final fallback to generateQuietPrompt
+    if (typeof context.generateQuietPrompt === 'function') {
+        const combinedPrompt = [effectiveSystemPrompt, userPrompt].filter(Boolean).join('\n\n');
+        const res = await context.generateQuietPrompt({
+            quietPrompt: combinedPrompt,
+            responseLength: safeMaxTokens,
+        });
+        const extracted = extractTextFromStResponse(res, jsonMode);
+        if (extracted) return extracted;
+    }
+
+    throw new Error('В SillyTavern не найден доступный метод генерации текста.');
+}
+
+/**
+ * Injects a minimalist status section into SillyTavern's Extensions Settings panel
+ */
+export function mountExtensionSettingsPanel(onToggleEnabled, onOpenSettings) {
+    const host = document.getElementById('extensions_settings2') || document.getElementById('extensions_settings');
+    if (!host || document.getElementById(SETTINGS_CONTAINER_ID)) return;
+
+    const settings = getSettings();
+    const wrapper = document.createElement('div');
+    wrapper.id = SETTINGS_CONTAINER_ID;
+    wrapper.className = 'clodex_st_settings_block';
+    wrapper.innerHTML = `
+        <div class="inline-drawer">
+            <div class="inline-drawer-toggle inline-drawer-header">
+                <b>CLODEx RP Studio</b>
+                <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+            </div>
+            <div class="inline-drawer-content" style="padding: 10px 0;">
+                <label class="checkbox_label" style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+                    <input id="clodex-st-enabled-checkbox" type="checkbox" ${settings.enabled ? 'checked' : ''} />
+                    <span>Enable CLODEx RP Studio HUD</span>
+                </label>
+                <button id="clodex-st-open-hud-settings" class="menu_button" type="button" style="width:100%;min-height:38px;">
+                    <i class="fa-solid fa-sliders"></i>&nbsp; Open Studio Settings
+                </button>
+            </div>
+        </div>
+    `;
+
+    host.appendChild(wrapper);
+
+    const checkbox = wrapper.querySelector('#clodex-st-enabled-checkbox');
+    if (checkbox) {
+        checkbox.addEventListener('change', (e) => {
+            const enabled = Boolean(e.target.checked);
+            saveSettings({ enabled });
+            if (typeof onToggleEnabled === 'function') onToggleEnabled(enabled);
         });
     }
 
-    loadStateForCurrentChat();
+    const openBtn = wrapper.querySelector('#clodex-st-open-hud-settings');
+    if (openBtn) {
+        openBtn.addEventListener('click', () => {
+            if (typeof onOpenSettings === 'function') onOpenSettings();
+        });
+    }
+}
 
-    const bridge = {
-        document,
-        fetchImpl,
-        mountContainer: document.body,
-        getLocale,
-        t,
-        confirm,
-        notify: msg => globalThis.toastr?.info?.(msg),
-        getEffectiveKey() {
-            if (settings.imageApiKey) return settings.imageApiKey;
-            if (settings.apiKey) return settings.apiKey;
-            const inherited = getContext()?.extensionSettings?.clodex?.savedKey ?? '';
-            return String(inherited || '').trim();
-        },
-        getImageBaseUrl() {
-            return String(settings.imageApiUrl || 'https://api.openai.com/v1').trim();
-        },
-        isKeyInherited() {
-            return !settings.imageApiKey && !settings.apiKey && Boolean(getContext()?.extensionSettings?.clodex?.savedKey);
-        },
-        getStProfiles() {
-            return getStConnectionProfiles(getContext());
-        },
-        async chatViaSt({ model, messages, temperature, maxTokens, jsonMode }) {
-            const requestedProfile = String(model || '').trim();
-            const profileId = requestedProfile && requestedProfile !== '__st_active__'
-                ? requestedProfile
-                : (settings.stTextProfileId || '');
-            return await sendTextRequestViaSillyTavern(getContext(), {
-                profileId,
-                messages,
-                temperature,
-                maxTokens,
-                jsonMode,
-            });
-        },
-        getSettings: () => settings,
-        async updateSettings(patch) {
-            for (const [k, v] of Object.entries(patch)) {
-                if (k === 'apiKey') {
-                    settings.apiKey = v ? validateKey(v) : '';
-                    if (settings.apiKey && !settings.imageApiKey) settings.imageApiKey = settings.apiKey;
-                } else if (k === 'imageApiKey') {
-                    settings.imageApiKey = String(v ?? '').trim();
-                    settings.apiKey = settings.imageApiKey;
-                } else if (k === 'imageApiUrl') {
-                    settings.imageApiUrl = String(v ?? '').trim() || 'https://api.openai.com/v1';
-                } else if (k === 'stTextProfileId' || k === 'stCodexProfileId') {
-                    settings[k] = String(v ?? '').trim();
-                } else if (k === 'maxAutoSpendUsd') {
-                    settings.maxAutoSpendUsd = normalizeMaxAutoSpend(v);
-                } else if (k in V13_DEFAULTS) {
-                    settings[k] = stCleanV13Settings({ ...settings, [k]: v })[k];
-                } else if (k in settings) {
-                    settings[k] = v;
-                }
-            }
-            getContext().saveSettingsDebounced?.();
-            pushExtensionPrompt();
-            renderTurnExtras();
-        },
-        getChatState() {
-            const cid = String(getContext().getCurrentChatId?.() ?? getContext().chatId ?? 'default');
-            if (cid !== currentChatId) loadStateForCurrentChat();
-            return chatState;
-        },
-        async saveChatState(nextState) {
-            chatState = normalizeChatState(nextState);
-            const ctx = getContext();
-            if (ctx.chatMetadata) {
-                ctx.chatMetadata[ST_SETTINGS_KEY] = chatState;
-                ctx.saveMetadataDebounced?.();
-            }
-            pushExtensionPrompt();
-            renderTurnExtras();
-        },
-        async getActiveTurnKeys() {
-            return stActiveTurnKeys(getContext().chat);
-        },
-        async getLatestTurnKey() {
-            const chat = getContext().chat ?? [];
-            for (let i = chat.length - 1; i >= 0; i -= 1) {
-                const msg = chat[i];
-                if (msg && !msg.is_user && !msg.is_system) return stTurnKey(i, msg);
-            }
-            return '';
-        },
-        async loadStore(name) {
-            if (!ST_STORE_NAMES.includes(name)) throw new Error(`Unknown store: ${name}`);
-            const raw = readStore(name);
-            return raw ? structuredClone(raw) : null;
-        },
-        async saveStore(name, value) {
-            if (!ST_STORE_NAMES.includes(name)) throw new Error(`Unknown store: ${name}`);
-            const ctx = getContext();
-            if (!ctx.chatMetadata) return;
-            ctx.chatMetadata[name] = structuredClone(value);
-            ctx.saveMetadataDebounced?.();
-            if (name === 'clodex_rp_wiki') pushExtensionPrompt();
-        },
-        async savePhoneMedia({ entryId, kind = 'photo', blob, base64 } = {}) {
-            const safeId = String(entryId || 'entry').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'entry';
-            const isAudio = kind === 'voice' || kind === 'audio';
-            const mediaBlob = blob || (base64 ? base64ToBlob(base64, isAudio ? 'audio/mpeg' : 'image/png') : null);
-            if (!mediaBlob) throw new Error('Phone media payload is empty.');
-            return await uploadMediaToSt(getContext(), fetchImpl, mediaBlob, isAudio ? 'mp3' : 'png', `clodex-phone-${safeId}`);
-        },
-        async exportPack(pack) {
-            const json = JSON.stringify(pack, null, 2);
-            const blob = new Blob([json], { type: 'application/json' });
-            if (blob.size > PACK_MAX_BYTES) throw new Error(`Pack is larger than ${PACK_MAX_BYTES} bytes.`);
-            const base = String(pack?.name || 'clodex').replace(/[^a-zA-Z0-9._-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'clodex';
-            downloadBlob(blob, `${base}.clodex-pack`);
-        },
-        async importPack() {
-            const text = await pickTextFile('.clodex-pack,.json,application/json', PACK_MAX_BYTES);
-            if (text === null || text === undefined) return null;
-            return JSON.parse(String(text).replace(/^\uFEFF/, ''));
-        },
-        async getRpContext({ limit = 6 } = {}) {
-            const take = Math.max(1, Math.min(80, Math.trunc(Number(limit) || 6)));
-            const ctx = getContext();
-            const charObj = ctx.characters?.[ctx.characterId];
-            const card = charObj?.data ?? charObj ?? {};
-            const recentMessages = (ctx.chat ?? [])
-                .filter(m => !m.is_system)
-                .slice(-take)
-                .map(m => ({
-                    role: m.is_user ? 'user' : 'assistant',
-                    name: m.name,
-                    content: String(m.mes ?? ''),
-                }));
-            return {
-                chatId: String(ctx.getCurrentChatId?.() ?? ctx.chatId ?? 'default'),
-                userName: ctx.name1 || 'User',
-                charName: ctx.name2 || card.name || 'Character',
-                charDescription: String(card.description ?? ''),
-                scenario: String(card.scenario ?? ''),
-                recentMessages,
-            };
-        },
-        async insertIntoComposer(text) {
-            const area = document.querySelector('#send_textarea');
-            if (!area) return;
-            area.value = area.value ? `${area.value}\n${text}` : text;
-            area.dispatchEvent(new Event('input', { bubbles: true }));
-        },
-        async applyImageBackground({ blob }) {
-            const url = await uploadMediaToSt(getContext(), fetchImpl, blob, 'png');
-            applyStImageOverlay(url);
-            return url;
-        },
-        async applyVideoBackground({ blob }) {
-            return await uploadMediaToSt(getContext(), fetchImpl, blob, 'mp4');
-        },
-        async clearSceneBackground() {
-            applyStImageOverlay('');
-        },
-        async loadCurrentSceneImageDataUrl(path) {
-            if (!path) return '';
-            if (/^data:image\//i.test(path)) return path;
-            const res = await fetchImpl(path, { credentials: 'same-origin' });
-            if (!res.ok) return '';
-            const blob = await res.blob();
-            return `data:${blob.type || 'image/png'};base64,${await blobToBase64(blob)}`;
-        },
-        async saveSpeechAudio({ blob, base64 }) {
-            const mediaBlob = blob || (base64 ? base64ToBlob(base64, 'audio/mpeg') : null);
-            if (!mediaBlob) throw new Error('Speech audio payload is empty.');
-            return await uploadMediaToSt(getContext(), fetchImpl, mediaBlob, 'mp3');
-        },
-        async saveCompanionMedia({ companionId, kind = 'image', blob, base64 } = {}) {
-            const safeId = String(companionId || 'main').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48) || 'main';
-            const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : 'png';
-            const mime = kind === 'video' ? 'video/mp4' : kind === 'audio' ? 'audio/mpeg' : 'image/png';
-            const mediaBlob = blob || (base64 ? base64ToBlob(base64, mime) : null);
-            if (!mediaBlob) throw new Error('Companion media payload is empty.');
-            return await uploadMediaToSt(getContext(), fetchImpl, mediaBlob, ext, `clodex-comp-${safeId}`);
-        },
-        playAudioPreview(path) {
-            if (!path || typeof Audio !== 'function') return;
-            const audio = new Audio(path);
-            audio.play().catch(() => {});
-        },
-        async importForgedCharacter({ pngBytes, fileName }) {
-            const ctx = getContext();
-            const blob = new Blob([pngBytes], { type: 'image/png' });
-            if (typeof FormData === 'function') {
-                const form = new FormData();
-                form.append('avatar', blob, fileName || 'clodex-card.png');
-                form.append('file_type', 'png');
-                const headers = new Headers(ctx.getRequestHeaders?.() ?? {});
-                headers.delete('Content-Type');
-                const res = await fetchImpl('/api/characters/import', {
-                    method: 'POST',
-                    headers,
-                    credentials: 'same-origin',
-                    body: form,
-                }).catch(() => null);
-                if (res?.ok) {
-                    await ctx.getCharacters?.();
-                    return true;
-                }
-            }
-            // Fallback: trigger PNG download so user can drag & drop into ST
-            await this.exportForgedCharacter({ pngBytes, fileName });
-            return true;
-        },
-        async exportForgedCharacter({ pngBytes, fileName }) {
-            downloadBlob(new Blob([pngBytes], { type: 'image/png' }), fileName || 'clodex-card.png');
-        },
-        loadHudPosition: () => settings.hudPos,
-        saveHudPosition(pos) {
-            settings.hudPos = pos;
-            getContext().saveSettingsDebounced?.();
-        },
-        getInsets: () => ({ topBar: 44, bottomInput: 78 }),
-    };
+/**
+ * Registers SillyTavern lifecycle & chat events
+ */
+export function registerStEvents(handlers = {}) {
+    const context = getStContext();
+    const eventSource = context?.eventSource || window?.eventSource;
+    const eventTypes = context?.event_types || context?.eventTypes || window?.event_types || {};
 
-    const controller = createRpStudioController(bridge);
-
-    for (const btn of settingsCard.querySelectorAll('[data-rp-open]')) {
-        btn.addEventListener('click', () => controller.openTab(btn.dataset.rpOpen));
+    if (!eventSource || typeof eventSource.on !== 'function') {
+        console.warn('[CLODEx-RP-Studio] SillyTavern eventSource not found.');
+        return () => {};
     }
 
-    // Hook into SillyTavern chat lifecycle events
-    const ev = context.eventSource;
-    const types = context.event_types ?? {};
-    const cleanups = [];
-    const listen = (eventName, fn) => {
-        if (!ev || !eventName) return;
-        ev.on(eventName, fn);
-        cleanups.push(() => ev.removeListener?.(eventName, fn));
+    const subscriptions = [];
+    const bind = (evtName, fn) => {
+        if (!evtName || typeof fn !== 'function') return;
+        eventSource.on(evtName, fn);
+        subscriptions.push(() => {
+            if (typeof eventSource.removeListener === 'function') {
+                eventSource.removeListener(evtName, fn);
+            } else if (typeof eventSource.off === 'function') {
+                eventSource.off(evtName, fn);
+            }
+        });
     };
 
-    const refreshLivingWorld = () => {
-        Promise.resolve(controller.reloadLivingWorld?.()).catch(() => {});
-    };
-
-    listen(types.CHAT_CHANGED, () => {
-        loadStateForCurrentChat();
-        controller.renderAll();
-        refreshLivingWorld();
-        renderTurnExtras();
+    bind(eventTypes.CHAT_CHANGED || 'chat_id_changed', () => {
+        if (typeof handlers.onChatChanged === 'function') handlers.onChatChanged();
     });
 
-    listen(types.MESSAGE_RECEIVED, index => {
-        const ctx = getContext();
-        const idx = Number.isInteger(index) ? index : Math.max(0, (ctx.chat?.length ?? 1) - 1);
-        const msg = ctx.chat?.[idx];
-        if (msg?.is_user || msg?.is_system) return;
-        controller.onAssistantMessageCommitted({ checkpointKey: stTurnKey(idx, msg) }).catch(() => {});
+    bind(eventTypes.MESSAGE_RECEIVED || 'message_received', (data) => {
+        if (typeof handlers.onMessageReceived === 'function') handlers.onMessageReceived(data);
     });
 
-    // Re-read the latest user line for wiki relevance right before generation.
-    listen(types.MESSAGE_SENT, () => pushExtensionPrompt());
-    listen(types.GENERATION_STARTED, () => pushExtensionPrompt());
-
-    listen(types.CHARACTER_MESSAGE_RENDERED, () => renderTurnExtras());
-    listen(types.USER_MESSAGE_RENDERED, () => renderTurnExtras());
-
-    // Swipe: exact snapshot of an existing variant, else roll back before the
-    // turn. Journals are never touched here — replay follows active keys (10.1).
-    listen(types.MESSAGE_SWIPED, index => {
-        const ctx = getContext();
-        const msg = ctx.chat?.[index];
-        if (!msg) return;
-        const key = stTurnKey(index, msg);
-        let restored = restoreCheckpointExact(chatState, key);
-        if (!restored) {
-            const first = chatState.checkpoints.find(cp => stParseTurnKey(cp.key).index === Number(index));
-            restored = Boolean(first) && restoreCheckpointBefore(chatState, first.key);
-        }
-        if (restored) bridge.saveChatState(chatState);
-        else renderTurnExtras();
-        pushExtensionPrompt();
-        controller.renderAll();
-        refreshLivingWorld();
+    bind(eventTypes.CHARACTER_MESSAGE_RENDERED || 'character_message_rendered', (data) => {
+        if (typeof handlers.onCharacterMessageRendered === 'function') handlers.onCharacterMessageRendered(data);
     });
 
-    // Deletion (ST passes the new chat length): GC journal ops of deleted /
-    // shifted messages, then roll the compact state back before them.
-    listen(types.MESSAGE_DELETED, newLength => {
-        const ctx = getContext();
-        const chat = Array.isArray(ctx.chat) ? ctx.chat : [];
-        const length = Number.isInteger(newLength) ? newLength : chat.length;
-        const activeTurnKeys = stActiveTurnKeys(chat);
-        const gcStores = [
-            ['clodex_rp_phone', phoneNormalizeStore, phoneGc],
-            ['clodex_rp_wiki', wikiNormalizeStore, wikiGc],
-        ];
-        for (const [name, normalize, gc] of gcStores) {
-            const raw = readStore(name);
-            if (!raw) continue;
+    bind(eventTypes.MESSAGE_SENT || 'message_sent', (data) => {
+        if (typeof handlers.onMessageSent === 'function') handlers.onMessageSent(data);
+    });
+
+    return () => {
+        subscriptions.forEach((unsub) => {
             try {
-                const store = normalize(raw);
-                const keys = new Set();
-                for (const op of store.journal ?? []) {
-                    if (op?.turnKey && stTurnKeyIsDead(chat, op.turnKey)) keys.add(op.turnKey);
-                }
-                if (!keys.size) continue;
-                ctx.chatMetadata[name] = gc(store, { deletedTurnKeys: [...keys], activeTurnKeys }) || store;
-                ctx.saveMetadataDebounced?.();
-            } catch (err) {
-                globalThis.console?.warn?.('[CLODEx RP Studio] journal GC failed', err);
+                unsub();
+            } catch {
+                // Ignore teardown errors
             }
-        }
-        const firstGone = chatState.checkpoints.find(cp => stTurnKeyIsDead(chat, cp.key) || stParseTurnKey(cp.key).index >= length);
-        if (firstGone && restoreCheckpointBefore(chatState, firstGone.key, { prune: true })) {
-            bridge.saveChatState(chatState);
-        } else {
-            pushExtensionPrompt();
-            renderTurnExtras();
-        }
-        controller.renderAll();
-        refreshLivingWorld();
-    });
-
-    // Register convenient slash commands if supported
-    if (typeof context.registerSlashCommand === 'function') {
-        context.registerSlashCommand('clodex-rp', () => controller.openTab('tracker'), [], 'Open CLODEx RP Studio Tracker', true, true);
-        context.registerSlashCommand('clodex-cradle', () => controller.openTab('cradle'), [], 'Open CLODEx Cradle & Familiar', true, true);
-        context.registerSlashCommand('clodex-codex', () => controller.openTab('codex'), [], 'Open CLODEx Lore Codex', true, true);
-        context.registerSlashCommand('clodex-scene', () => controller.openTab('scene'), [], 'Open CLODEx Scene & Voice', true, true);
-        context.registerSlashCommand('clodex-forge', () => controller.openTab('forge'), [], 'Open CLODEx Character & Lorebook Forge', true, true);
-        context.registerSlashCommand('clodex-speak', () => controller.speakLatestReply({ auto: false }), [], 'Speak latest character reply via CLODEx TTS', true, true);
-        context.registerSlashCommand('clodex-phone', () => controller.openTab('phone'), [], 'Open CLODEx character phone / diary & world feed', true, true);
-        context.registerSlashCommand('clodex-wiki', () => controller.openTab('wiki'), [], 'Open CLODEx living session wiki', true, true);
-        context.registerSlashCommand('clodex-director', () => controller.openTab('director'), [], 'Open CLODEx director panel (next reply modifiers)', true, true);
-    }
-
-    renderTurnExtras();
-
-    return {
-        controller,
-        dispose() {
-            for (const fn of cleanups) fn();
-            getContext()?.setExtensionPrompt?.(ST_PROMPT_KEY, '', ST_PROMPT_IN_CHAT, 1);
-            getContext()?.setExtensionPrompt?.(ST_DEPTH0_PROMPT_KEY, '', ST_PROMPT_IN_CHAT, 0);
-            removeTurnExtras();
-            controller.dispose();
-            customImageBgEl?.remove();
-            settingsCard?.remove();
-        },
+        });
     };
-            }
+}
+
+/**
+ * Unified Bridge Object consumed by HUD and API modules
+ */
+export function createStBridge() {
+    return {
+        getContext: getStContext,
+        getSettings,
+        saveSettings,
+        resetSettings,
+        getChatMessages,
+        getActiveCharacterName,
+        getCurrentCharacterAvatar,
+        getChatId,
+        loadChatState,
+        saveChatState,
+        clearChatState,
+        getStProfiles,
+        getConnectionProfiles: getStProfiles,
+        getImageBaseUrl,
+        chatViaSt: sendTextRequestViaSillyTavern,
+        stChat: sendTextRequestViaSillyTavern,
+        mountExtensionSettingsPanel,
+        registerStEvents,
+    };
+                }
